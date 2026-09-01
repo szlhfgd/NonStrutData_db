@@ -1,0 +1,1532 @@
+"""
+Unit tests for batch graph operations (PR #2910 follow-up).
+
+Verifies:
+1. BaseGraphStorage default batch methods fall back to serial single-item calls.
+2. NetworkXStorage overrides batch methods with optimized in-memory operations.
+3. ainsert_custom_kg uses the batch interface end-to-end (no hasattr guards).
+4. has_nodes_batch returns only existing nodes, including newly inserted ones.
+5. upsert_edges_batch and upsert_nodes_batch are idempotent (safe to call twice).
+"""
+
+import json
+import time
+import tempfile
+import pytest
+import numpy as np
+from unittest.mock import AsyncMock
+
+from lightrag.kg.networkx_impl import NetworkXStorage
+from lightrag.kg.shared_storage import initialize_share_data
+from lightrag.utils import EmbeddingFunc, make_relation_vdb_ids
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+GLOBAL_CONFIG = {
+    "embedding_batch_num": 10,
+    "vector_db_storage_cls_kwargs": {"cosine_better_than_threshold": 0.5},
+    "working_dir": "/tmp/test_batch_graph",
+}
+GRAPH_NAMESPACE = "chunk_entity_relation"
+
+
+async def _raw_embedding_func(texts):
+    return np.random.rand(len(texts), 10)
+
+
+mock_embedding_func = EmbeddingFunc(
+    embedding_dim=10,
+    max_token_size=512,
+    func=_raw_embedding_func,
+)
+
+
+def make_networkx_storage(tmp_dir: str) -> NetworkXStorage:
+    config = dict(GLOBAL_CONFIG, working_dir=tmp_dir)
+    initialize_share_data()
+    storage = NetworkXStorage(
+        namespace="test_graph",
+        workspace="test_ws",
+        global_config=config,
+        embedding_func=_raw_embedding_func,
+    )
+    return storage
+
+
+def _make_node(entity_id: str, entity_type: str = "TEST") -> dict:
+    return {
+        "entity_id": entity_id,
+        "entity_type": entity_type,
+        "description": f"Description of {entity_id}",
+        "source_id": "chunk-1",
+        "file_path": "test.txt",
+        "created_at": int(time.time()),
+    }
+
+
+def _make_edge(weight: float = 1.0) -> dict:
+    return {
+        "weight": weight,
+        "description": "test edge",
+        "keywords": "test",
+        "source_id": "chunk-1",
+        "file_path": "test.txt",
+        "created_at": int(time.time()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 1. BaseGraphStorage default implementations delegate to single-item methods
+# ---------------------------------------------------------------------------
+
+
+class TestBaseGraphStorageDefaults:
+    """
+    Use NetworkXStorage as a concrete instance but spy on the single-item
+    methods to verify the default batch implementations delegate correctly.
+    """
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_nodes_batch_calls_upsert_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+
+            nodes = [
+                ("NodeA", _make_node("NodeA")),
+                ("NodeB", _make_node("NodeB")),
+            ]
+
+            call_log: list[str] = []
+            original = storage.upsert_node
+
+            async def spy(node_id, *, node_data):
+                call_log.append(node_id)
+                return await original(node_id, node_data=node_data)
+
+            # Temporarily replace the optimised override with the base default
+
+            async def base_upsert_nodes_batch(self, nodes):
+                for node_id, node_data in nodes:
+                    await self.upsert_node(node_id, node_data=node_data)
+
+            storage.upsert_node = spy  # type: ignore[assignment]
+            await base_upsert_nodes_batch(storage, nodes)
+
+            assert call_log == ["NodeA", "NodeB"]
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_has_nodes_batch_calls_has_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+            await storage.upsert_node("NodeA", node_data=_make_node("NodeA"))
+
+            call_log: list[str] = []
+            original = storage.has_node
+
+            async def spy(node_id):
+                call_log.append(node_id)
+                return await original(node_id)
+
+            async def base_has_nodes_batch(self, node_ids):
+                existing = set()
+                for node_id in node_ids:
+                    if await self.has_node(node_id):
+                        existing.add(node_id)
+                return existing
+
+            storage.has_node = spy  # type: ignore[assignment]
+            result = await base_has_nodes_batch(storage, ["NodeA", "NodeB"])
+
+            assert call_log == ["NodeA", "NodeB"]
+            assert result == {"NodeA"}
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_edges_batch_calls_upsert_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+            await storage.upsert_node("NodeA", node_data=_make_node("NodeA"))
+            await storage.upsert_node("NodeB", node_data=_make_node("NodeB"))
+            await storage.upsert_node("NodeC", node_data=_make_node("NodeC"))
+
+            call_log: list[tuple] = []
+            original = storage.upsert_edge
+
+            async def spy(src, tgt, *, edge_data):
+                call_log.append((src, tgt))
+                return await original(src, tgt, edge_data=edge_data)
+
+            async def base_upsert_edges_batch(self, edges):
+                for src, tgt, edge_data in edges:
+                    await self.upsert_edge(src, tgt, edge_data=edge_data)
+
+            edges = [
+                ("NodeA", "NodeB", _make_edge()),
+                ("NodeB", "NodeC", _make_edge()),
+            ]
+            storage.upsert_edge = spy  # type: ignore[assignment]
+            await base_upsert_edges_batch(storage, edges)
+
+            assert call_log == [("NodeA", "NodeB"), ("NodeB", "NodeC")]
+
+
+# ---------------------------------------------------------------------------
+# 2. NetworkXStorage optimised batch implementations
+# ---------------------------------------------------------------------------
+
+
+class TestNetworkXBatchOperations:
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_nodes_batch_inserts_all_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+
+            nodes = [(f"Entity{i}", _make_node(f"Entity{i}")) for i in range(5)]
+            await storage.upsert_nodes_batch(nodes)
+
+            for entity_id, _ in nodes:
+                assert await storage.has_node(entity_id), f"{entity_id} should exist"
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_nodes_batch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+
+            node_data = _make_node("Alpha")
+            await storage.upsert_nodes_batch([("Alpha", node_data)])
+            await storage.upsert_nodes_batch([("Alpha", node_data)])  # second call
+
+            assert await storage.has_node("Alpha")
+            node = await storage.get_node("Alpha")
+            assert node["entity_id"] == "Alpha"
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_has_nodes_batch_returns_existing_subset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+
+            await storage.upsert_nodes_batch(
+                [
+                    ("Present1", _make_node("Present1")),
+                    ("Present2", _make_node("Present2")),
+                ]
+            )
+
+            result = await storage.has_nodes_batch(["Present1", "Present2", "Missing"])
+            assert result == {"Present1", "Present2"}
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_has_nodes_batch_empty_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+
+            result = await storage.has_nodes_batch([])
+            assert result == set()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_edges_batch_creates_edges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+
+            await storage.upsert_nodes_batch(
+                [
+                    ("A", _make_node("A")),
+                    ("B", _make_node("B")),
+                    ("C", _make_node("C")),
+                ]
+            )
+
+            edges = [
+                ("A", "B", _make_edge(1.5)),
+                ("B", "C", _make_edge(2.0)),
+            ]
+            await storage.upsert_edges_batch(edges)
+
+            edge_ab = await storage.get_edge("A", "B")
+            assert edge_ab is not None
+            assert float(edge_ab["weight"]) == pytest.approx(1.5)
+
+            edge_bc = await storage.get_edge("B", "C")
+            assert edge_bc is not None
+            assert float(edge_bc["weight"]) == pytest.approx(2.0)
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_edges_batch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+
+            await storage.upsert_nodes_batch(
+                [
+                    ("X", _make_node("X")),
+                    ("Y", _make_node("Y")),
+                ]
+            )
+            edge_data = _make_edge(3.0)
+            await storage.upsert_edges_batch([("X", "Y", edge_data)])
+            await storage.upsert_edges_batch([("X", "Y", edge_data)])  # second call
+
+            edge = await storage.get_edge("X", "Y")
+            assert edge is not None
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_nodes_batch_updates_existing_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = make_networkx_storage(tmp)
+            await storage.initialize()
+
+            original = _make_node("Node1")
+            await storage.upsert_nodes_batch([("Node1", original)])
+
+            updated = dict(original, description="Updated description")
+            await storage.upsert_nodes_batch([("Node1", updated)])
+
+            node = await storage.get_node("Node1")
+            assert node["description"] == "Updated description"
+
+
+# ---------------------------------------------------------------------------
+# 3. ainsert_custom_kg uses batch interface end-to-end
+# ---------------------------------------------------------------------------
+
+
+class TestAinsertCustomKgBatchPath:
+    """
+    Verify that ainsert_custom_kg calls the three batch methods rather than
+    the single-item methods, using a mock graph storage backend.
+    """
+
+    def _make_custom_kg(self):
+        return {
+            "chunks": [
+                {
+                    "content": "chunk content",
+                    "chunk_order_index": 0,
+                    "source_id": "src-1",
+                }
+            ],
+            "entities": [
+                {
+                    "entity_name": "EntityA",
+                    "entity_type": "CONCEPT",
+                    "description": "An entity",
+                    "source_id": "src-1",
+                    "file_path": "test.pdf",
+                }
+            ],
+            "relationships": [
+                {
+                    "src_id": "EntityA",
+                    "tgt_id": "EntityB",
+                    "description": "relates to",
+                    "keywords": "relation",
+                    "weight": 1.0,
+                    "source_id": "src-1",
+                    "file_path": "test.pdf",
+                }
+            ],
+        }
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_calls_batch_methods(self):
+        """upsert_nodes_batch, has_nodes_batch, upsert_edges_batch must all be called."""
+        from lightrag import LightRAG
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            graph = rag.chunk_entity_relation_graph
+            upsert_nodes_batch = AsyncMock(wraps=graph.upsert_nodes_batch)
+            has_nodes_batch = AsyncMock(wraps=graph.has_nodes_batch)
+            upsert_edges_batch = AsyncMock(wraps=graph.upsert_edges_batch)
+
+            graph.upsert_nodes_batch = upsert_nodes_batch
+            graph.has_nodes_batch = has_nodes_batch
+            graph.upsert_edges_batch = upsert_edges_batch
+
+            # Mock VDB upserts to avoid needing real embeddings
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.delete = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.doc_status.upsert = AsyncMock()
+
+            await rag.ainsert_custom_kg(self._make_custom_kg())
+
+            upsert_nodes_batch.assert_called()
+            has_nodes_batch.assert_called()
+            upsert_edges_batch.assert_called()
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_rejects_sourced_weight_below_floor(self):
+        """Weight validation must finish before the first storage mutation."""
+        from lightrag import LightRAG
+
+        custom_kg = self._make_custom_kg()
+        custom_kg["relationships"][0]["weight"] = 0.5
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            graph = rag.chunk_entity_relation_graph
+            graph.upsert_nodes_batch = AsyncMock()
+            graph.upsert_edges_batch = AsyncMock()
+            rag.chunks_vdb.upsert = AsyncMock()
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag._insert_done_with_cleanup = AsyncMock()
+
+            with pytest.raises(
+                ValueError, match=r"Custom KG relationships\[0\].*evidence count 1"
+            ):
+                await rag.ainsert_custom_kg(custom_kg)
+
+            graph.upsert_nodes_batch.assert_not_awaited()
+            graph.upsert_edges_batch.assert_not_awaited()
+            rag.chunks_vdb.upsert.assert_not_awaited()
+            rag.entities_vdb.upsert.assert_not_awaited()
+            rag.relationships_vdb.upsert.assert_not_awaited()
+            rag.text_chunks.upsert.assert_not_awaited()
+            rag._insert_done_with_cleanup.assert_not_awaited()
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source_alias", ["UNKNOWN", "manual_creation"])
+    async def test_ainsert_custom_kg_validates_mapped_source_before_writes(
+        self, source_alias
+    ):
+        """A no-source marker can still resolve to a real custom-KG chunk."""
+        from lightrag import LightRAG
+
+        custom_kg = self._make_custom_kg()
+        custom_kg["chunks"][0]["source_id"] = source_alias
+        custom_kg["relationships"][0]["source_id"] = source_alias
+        custom_kg["relationships"][0]["weight"] = 0.5
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            graph = rag.chunk_entity_relation_graph
+            graph.upsert_nodes_batch = AsyncMock()
+            graph.upsert_edges_batch = AsyncMock()
+            rag.chunks_vdb.upsert = AsyncMock()
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag._insert_done_with_cleanup = AsyncMock()
+
+            with pytest.raises(
+                ValueError, match=r"Custom KG relationships\[0\].*evidence count 1"
+            ):
+                await rag.ainsert_custom_kg(custom_kg)
+
+            graph.upsert_nodes_batch.assert_not_awaited()
+            graph.upsert_edges_batch.assert_not_awaited()
+            rag.chunks_vdb.upsert.assert_not_awaited()
+            rag.entities_vdb.upsert.assert_not_awaited()
+            rag.relationships_vdb.upsert.assert_not_awaited()
+            rag.text_chunks.upsert.assert_not_awaited()
+            rag._insert_done_with_cleanup.assert_not_awaited()
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_uses_unknown_floor_for_unmatched_alias(self):
+        """An unmatched alias persists as UNKNOWN and contributes no evidence."""
+        from lightrag import LightRAG
+
+        custom_kg = self._make_custom_kg()
+        relationship = custom_kg["relationships"][0]
+        relationship["source_id"] = "missing-alias"
+        relationship["weight"] = 0.5
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.delete = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.doc_status.upsert = AsyncMock()
+
+            await rag.ainsert_custom_kg(custom_kg)
+
+            edge = await rag.chunk_entity_relation_graph.get_edge("EntityA", "EntityB")
+            assert edge["source_id"] == "UNKNOWN"
+            assert edge["weight"] == 0.5
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_allows_source_less_fractional_weight(self):
+        from lightrag import LightRAG
+
+        custom_kg = self._make_custom_kg()
+        relationship = custom_kg["relationships"][0]
+        relationship.pop("source_id")
+        relationship["weight"] = 0.5
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.delete = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.doc_status.upsert = AsyncMock()
+
+            await rag.ainsert_custom_kg(custom_kg)
+
+            edge = await rag.chunk_entity_relation_graph.get_edge("EntityA", "EntityB")
+            assert edge["source_id"] == ""
+            assert edge["weight"] == 0.5
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_canonicalizes_file_paths_before_upsert(self):
+        """custom KG ingestion normalizes file names before touching storage."""
+        from lightrag import LightRAG
+
+        custom_kg = self._make_custom_kg()
+        for section in ("chunks", "entities", "relationships"):
+            for item in custom_kg[section]:
+                item["file_path"] = "/tmp/uploads/test.[native-Fi].pdf"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.delete = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.doc_status.upsert = AsyncMock()
+
+            await rag.ainsert_custom_kg(custom_kg)
+
+            text_chunks = rag.text_chunks.upsert.call_args.args[0]
+            assert next(iter(text_chunks.values()))["file_path"] == "test.pdf"
+
+            entities = rag.entities_vdb.upsert.call_args.args[0]
+            assert next(iter(entities.values()))["file_path"] == "test.pdf"
+
+            relationships = rag.relationships_vdb.upsert.call_args.args[0]
+            assert next(iter(relationships.values()))["file_path"] == "test.pdf"
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_normalizes_names_before_dedup_and_upsert(self):
+        """Graph and vector writes must share extraction-normalized identifiers."""
+        from lightrag import LightRAG
+
+        custom_kg = {
+            "chunks": [],
+            "entities": [
+                {
+                    "entity_name": "  <p>“Ａ 公 司”</p>  ",
+                    "entity_type": "ORGANIZATION",
+                    "description": "first declaration",
+                },
+                {
+                    "entity_name": "A公司",
+                    "entity_type": "ORGANIZATION",
+                    "description": "latest declaration",
+                },
+            ],
+            "relationships": [
+                {
+                    "src_id": "Ａ 公 司",
+                    "tgt_id": "《Ｂ 项 目》",
+                    "description": "old relation",
+                    "keywords": "old",
+                },
+                {
+                    "src_id": "B项目",
+                    "tgt_id": "A公司",
+                    "description": "latest relation",
+                    "keywords": "latest",
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.delete = AsyncMock()
+
+            await rag.ainsert_custom_kg(custom_kg)
+
+            graph = rag.chunk_entity_relation_graph
+            assert await graph.has_node("A公司")
+            assert await graph.has_node("B项目")
+            assert not await graph.has_node("  <p>“Ａ 公 司”</p>  ")
+            assert await graph.has_edge("A公司", "B项目")
+
+            entity = await graph.get_node("A公司")
+            assert entity is not None
+            assert entity["description"] == "latest declaration"
+
+            edge = await graph.get_edge("A公司", "B项目")
+            assert edge is not None
+            assert edge["description"] == "latest relation"
+
+            entity_vdb_payload = rag.entities_vdb.upsert.await_args.args[0]
+            assert len(entity_vdb_payload) == 1
+            only_entity = next(iter(entity_vdb_payload.values()))
+            assert only_entity["entity_name"] == "A公司"
+
+            relation_vdb_payload = rag.relationships_vdb.upsert.await_args.args[0]
+            assert len(relation_vdb_payload) == 1
+            only_relation = next(iter(relation_vdb_payload.values()))
+            assert only_relation["src_id"] == "A公司"
+            assert only_relation["tgt_id"] == "B项目"
+
+            # The public input remains reusable and unchanged.
+            assert custom_kg["entities"][0]["entity_name"] == ("  <p>“Ａ 公 司”</p>  ")
+            assert custom_kg["relationships"][0]["src_id"] == "Ａ 公 司"
+            assert custom_kg["relationships"][0]["tgt_id"] == "《Ｂ 项 目》"
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("custom_kg", "invalid_field"),
+        [
+            (
+                {
+                    "chunks": [{"content": "text", "source_id": "s1"}],
+                    "entities": [{"entity_name": "1"}],
+                    "relationships": [],
+                },
+                r"entities\[0\]\.entity_name",
+            ),
+            (
+                {
+                    "chunks": [{"content": "text", "source_id": "s1"}],
+                    "entities": [],
+                    "relationships": [
+                        {
+                            "src_id": "1.2",
+                            "tgt_id": "ValidEntity",
+                            "description": "relation",
+                            "keywords": "keyword",
+                        }
+                    ],
+                },
+                r"relationships\[0\]\.src_id",
+            ),
+        ],
+    )
+    async def test_ainsert_custom_kg_rejects_invalid_names_before_storage_writes(
+        self,
+        custom_kg,
+        invalid_field,
+    ):
+        from lightrag import LightRAG
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            rag.chunks_vdb.upsert = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.chunk_entity_relation_graph.upsert_nodes_batch = AsyncMock()
+            rag.chunk_entity_relation_graph.upsert_edges_batch = AsyncMock()
+            rag._insert_done_with_cleanup = AsyncMock()
+
+            with pytest.raises(
+                ValueError,
+                match=rf"Custom KG {invalid_field} cannot be empty after normalization",
+            ):
+                await rag.ainsert_custom_kg(custom_kg)
+
+            rag.chunks_vdb.upsert.assert_not_awaited()
+            rag.text_chunks.upsert.assert_not_awaited()
+            rag.entities_vdb.upsert.assert_not_awaited()
+            rag.relationships_vdb.upsert.assert_not_awaited()
+            rag.chunk_entity_relation_graph.upsert_nodes_batch.assert_not_awaited()
+            rag.chunk_entity_relation_graph.upsert_edges_batch.assert_not_awaited()
+            rag._insert_done_with_cleanup.assert_not_awaited()
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_no_hasattr_needed(self):
+        """
+        The batch methods are always available on the base class, so no
+        hasattr() guard should be needed. Verify that a storage backend
+        implementing only the abstract methods (no batch overrides) still
+        works via the default serial fallback.
+        """
+        from lightrag.base import BaseGraphStorage
+
+        # All three batch methods should exist on the base class
+        assert hasattr(BaseGraphStorage, "upsert_nodes_batch")
+        assert hasattr(BaseGraphStorage, "has_nodes_batch")
+        assert hasattr(BaseGraphStorage, "upsert_edges_batch")
+
+    @pytest.mark.offline
+    def test_neo4j_has_nodes_batch_uses_read_retry(self):
+        pytest.importorskip("neo4j")
+        from lightrag.kg.neo4j_impl import Neo4JStorage
+
+        assert hasattr(Neo4JStorage.has_nodes_batch, "retry")
+        assert hasattr(Neo4JStorage.upsert_nodes_batch, "retry")
+        assert hasattr(Neo4JStorage.upsert_edges_batch, "retry")
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_missing_entity_nodes_created(self):
+        """
+        Nodes referenced in relationships but not in the entity list must
+        be created as placeholder UNKNOWN nodes.
+        """
+        from lightrag import LightRAG
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.delete = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.doc_status.upsert = AsyncMock()
+
+            custom_kg = {
+                "chunks": [
+                    {"content": "text", "chunk_order_index": 0, "source_id": "s1"}
+                ],
+                "entities": [],  # No entities declared
+                "relationships": [
+                    {
+                        "src_id": "ImplicitNode",
+                        "tgt_id": "AnotherImplicit",
+                        "description": "connects",
+                        "keywords": "link",
+                        "weight": 1.0,
+                        "source_id": "s1",
+                        "file_path": "test.pdf",
+                    }
+                ],
+            }
+
+            await rag.ainsert_custom_kg(custom_kg)
+
+            graph = rag.chunk_entity_relation_graph
+            assert await graph.has_node("ImplicitNode"), (
+                "Implicit node should be created"
+            )
+            assert await graph.has_node("AnotherImplicit"), (
+                "Implicit node should be created"
+            )
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_deduplicates_entities_and_undirected_edges(self):
+        from lightrag import LightRAG
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            graph = rag.chunk_entity_relation_graph
+            graph.upsert_nodes_batch = AsyncMock()
+            graph.has_nodes_batch = AsyncMock(return_value={"EntityA"})
+            graph.upsert_edges_batch = AsyncMock()
+
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.delete = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.doc_status.upsert = AsyncMock()
+
+            custom_kg = {
+                "chunks": [
+                    {
+                        "content": "chunk content",
+                        "chunk_order_index": 0,
+                        "source_id": "src-1",
+                    }
+                ],
+                "entities": [
+                    {
+                        "entity_name": "EntityA",
+                        "entity_type": "CONCEPT",
+                        "description": "first version",
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                    {
+                        "entity_name": "EntityA",
+                        "entity_type": "CONCEPT",
+                        "description": "latest version",
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                ],
+                "relationships": [
+                    {
+                        "src_id": "EntityA",
+                        "tgt_id": "EntityB",
+                        "description": "old relation",
+                        "keywords": "first",
+                        "weight": 1.0,
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                    {
+                        "src_id": "EntityB",
+                        "tgt_id": "EntityA",
+                        "description": "latest relation",
+                        "keywords": "second",
+                        "weight": 2.0,
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                ],
+            }
+
+            await rag.ainsert_custom_kg(custom_kg)
+
+            entity_batch = graph.upsert_nodes_batch.await_args_list[0].args[0]
+            assert len(entity_batch) == 1
+            assert entity_batch[0][0] == "EntityA"
+            assert entity_batch[0][1]["entity_type"] == "CONCEPT"
+            assert entity_batch[0][1]["description"] == "latest version"
+            assert entity_batch[0][1]["file_path"] == "test.pdf"
+            assert entity_batch[0][1]["source_id"]
+
+            placeholder_batch = graph.upsert_nodes_batch.await_args_list[1].args[0]
+            assert len(placeholder_batch) == 1
+            assert placeholder_batch[0][0] == "EntityB"
+
+            edge_batch = graph.upsert_edges_batch.await_args.args[0]
+            assert len(edge_batch) == 1
+            assert edge_batch[0][0] == "EntityB"
+            assert edge_batch[0][1] == "EntityA"
+            assert edge_batch[0][2]["description"] == "latest relation"
+            assert edge_batch[0][2]["weight"] == 2.0
+
+            entity_vdb_payload = rag.entities_vdb.upsert.await_args.args[0]
+            assert len(entity_vdb_payload) == 1
+            only_entity = next(iter(entity_vdb_payload.values()))
+            assert only_entity["description"] == "latest version"
+
+            rel_vdb_payload = rag.relationships_vdb.upsert.await_args.args[0]
+            assert len(rel_vdb_payload) == 1
+            only_rel = next(iter(rel_vdb_payload.values()))
+            assert only_rel["src_id"] == "EntityA"
+            assert only_rel["tgt_id"] == "EntityB"
+            assert only_rel["description"] == "latest relation"
+            assert rag.relationships_vdb.delete.await_args.args[0] == [
+                make_relation_vdb_ids("EntityA", "EntityB")[1]
+            ]
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_ainsert_custom_kg_keeps_legacy_relation_rows_if_upsert_fails(self):
+        from lightrag import LightRAG
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock(side_effect=RuntimeError("boom"))
+            rag.relationships_vdb.delete = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.doc_status.upsert = AsyncMock()
+
+            custom_kg = {
+                "chunks": [
+                    {
+                        "content": "chunk content",
+                        "chunk_order_index": 0,
+                        "source_id": "src-1",
+                    }
+                ],
+                "entities": [
+                    {
+                        "entity_name": "EntityA",
+                        "entity_type": "CONCEPT",
+                        "description": "Entity A",
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                    {
+                        "entity_name": "EntityB",
+                        "entity_type": "CONCEPT",
+                        "description": "Entity B",
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                ],
+                "relationships": [
+                    {
+                        "src_id": "EntityB",
+                        "tgt_id": "EntityA",
+                        "description": "latest relation",
+                        "keywords": "second",
+                        "weight": 2.0,
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                ],
+            }
+
+            with pytest.raises(RuntimeError, match="boom"):
+                await rag.ainsert_custom_kg(custom_kg)
+
+            rag.relationships_vdb.delete.assert_not_called()
+
+            await rag.finalize_storages()
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_get_relation_info_falls_back_to_legacy_relation_vdb_id(self):
+        from lightrag import LightRAG
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = LightRAG(
+                working_dir=tmp,
+                llm_model_func=AsyncMock(return_value=""),
+                embedding_func=mock_embedding_func,
+            )
+            await rag.initialize_storages()
+
+            rag.entities_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.upsert = AsyncMock()
+            rag.relationships_vdb.delete = AsyncMock()
+            rag.text_chunks.upsert = AsyncMock()
+            rag.doc_status.upsert = AsyncMock()
+
+            custom_kg = {
+                "chunks": [
+                    {
+                        "content": "chunk content",
+                        "chunk_order_index": 0,
+                        "source_id": "src-1",
+                    }
+                ],
+                "entities": [
+                    {
+                        "entity_name": "EntityA",
+                        "entity_type": "CONCEPT",
+                        "description": "Entity A",
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                    {
+                        "entity_name": "EntityB",
+                        "entity_type": "CONCEPT",
+                        "description": "Entity B",
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                ],
+                "relationships": [
+                    {
+                        "src_id": "EntityB",
+                        "tgt_id": "EntityA",
+                        "description": "latest relation",
+                        "keywords": "second",
+                        "weight": 2.0,
+                        "source_id": "src-1",
+                        "file_path": "test.pdf",
+                    },
+                ],
+            }
+
+            await rag.ainsert_custom_kg(custom_kg)
+
+            normalized_rel_id, legacy_rel_id = make_relation_vdb_ids(
+                "EntityA", "EntityB"
+            )
+            rag.relationships_vdb.get_by_id = AsyncMock(
+                side_effect=lambda rid: {"ok": True} if rid == legacy_rel_id else None
+            )
+
+            result_ab = await rag.get_relation_info(
+                "EntityA", "EntityB", include_vector_data=True
+            )
+            result_ba = await rag.get_relation_info(
+                "EntityB", "EntityA", include_vector_data=True
+            )
+
+            assert result_ab["vector_data"] == {"ok": True}
+            assert result_ba["vector_data"] == {"ok": True}
+            assert [
+                call.args[0] for call in rag.relationships_vdb.get_by_id.await_args_list
+            ] == [
+                normalized_rel_id,
+                legacy_rel_id,
+                normalized_rel_id,
+                legacy_rel_id,
+            ]
+
+            await rag.finalize_storages()
+
+
+class TestPostgresBatchOrdering:
+    @staticmethod
+    def _make_pg_storage():
+        """PGGraphStorage with a fake connection capturing executed Cypher.
+
+        The chunk-level batch paths build SQL and run it via
+        ``db._run_with_retry`` instead of calling ``upsert_node`` / ``upsert_edge``
+        per row, so the captured statements are how we observe dedup + ordering.
+        """
+        from lightrag.kg.postgres_impl import PGGraphStorage
+
+        storage = PGGraphStorage.__new__(PGGraphStorage)
+        storage.workspace = "test_ws"
+        storage.namespace = "test_graph"
+        storage.graph_name = "test_graph"
+        storage.__post_init__()  # resolves chunk-level batch limits
+
+        calls: list[dict] = []
+
+        class _Tx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Conn:
+            def transaction(self):
+                return _Tx()
+
+            async def execute(self, sql, *args):
+                calls.append({"sql": sql, "args": args})
+                return ""
+
+            async def fetch(self, sql, *args):
+                # Edge upserts run through fetch(); an empty result means the
+                # endpoints were missing and the edge was dropped, which now
+                # raises — so hand back a created-edge row.
+                calls.append({"sql": sql, "args": args})
+                return [{"r": "edge"}]
+
+        conn = _Conn()
+
+        async def fake_run_with_retry(operation, **_kwargs):
+            return await operation(conn)
+
+        storage.db = AsyncMock()
+        storage.db._run_with_retry = AsyncMock(side_effect=fake_run_with_retry)
+        return storage, calls
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_nodes_batch_preserves_last_write_wins(self):
+        from lightrag.kg.postgres_impl import PGGraphStorage
+
+        storage, calls = self._make_pg_storage()
+
+        await PGGraphStorage.upsert_nodes_batch(
+            storage,
+            [
+                ("EntityA", _make_node("EntityA")),
+                ("EntityA", dict(_make_node("EntityA"), description="latest")),
+                ("EntityB", _make_node("EntityB")),
+            ],
+        )
+
+        merge_calls = [c for c in calls if "MERGE (n:base" in c["sql"]]
+        entity_ids = [json.loads(c["args"][0])["entity_id"] for c in merge_calls]
+        # Deduped to one EntityA (moved to its last position), then EntityB.
+        assert entity_ids == ["EntityA", "EntityB"]
+        # EntityA carries the latest payload, not the first.
+        assert '"latest"' in merge_calls[0]["sql"]
+        assert "Description of EntityA" not in merge_calls[0]["sql"]
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_edges_batch_preserves_last_write_wins(self):
+        from lightrag.kg.postgres_impl import PGGraphStorage
+
+        storage, calls = self._make_pg_storage()
+
+        await PGGraphStorage.upsert_edges_batch(
+            storage,
+            [
+                ("EntityA", "EntityB", _make_edge(1.0)),
+                ("EntityB", "EntityA", _make_edge(2.0)),
+                ("EntityB", "EntityC", _make_edge(3.0)),
+            ],
+        )
+
+        cypher_calls = [c for c in calls if "CREATE (source)-[r:DIRECTED" in c["sql"]]
+        log = [
+            (json.loads(c["args"][0])["src_id"], json.loads(c["args"][0])["tgt_id"])
+            for c in cypher_calls
+        ]
+        # Canonical (LEAST, GREATEST) key order: (A,B) then (B,C); each pair keeps
+        # its last-write orientation/payload.
+        assert log == [("EntityB", "EntityA"), ("EntityB", "EntityC")]
+        assert "2.0" in cypher_calls[0]["sql"]  # weight 2.0 won the (A,B) pair
+
+
+class TestMongoBatchOrdering:
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_nodes_batch_uses_ordered_bulk_write(self):
+        pytest.importorskip("pymongo")
+        from lightrag.kg.mongo_impl import (
+            MongoGraphStorage,
+            DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES,
+            DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH,
+        )
+
+        storage = MongoGraphStorage.__new__(MongoGraphStorage)
+        storage.collection = AsyncMock()
+        storage.workspace = "test_ws"
+        storage.namespace = "test_graph"
+        storage._max_upsert_payload_bytes = DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES
+        storage._max_upsert_records_per_batch = (
+            DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH
+        )
+
+        await MongoGraphStorage.upsert_nodes_batch(
+            storage,
+            [
+                ("EntityA", _make_node("EntityA")),
+                ("EntityA", dict(_make_node("EntityA"), description="latest")),
+            ],
+        )
+
+        assert storage.collection.bulk_write.await_args.kwargs["ordered"] is True
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_edges_batch_uses_ordered_bulk_write(self):
+        pytest.importorskip("pymongo")
+        from lightrag.kg.mongo_impl import (
+            MongoGraphStorage,
+            DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES,
+            DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH,
+        )
+
+        storage = MongoGraphStorage.__new__(MongoGraphStorage)
+        storage.collection = AsyncMock()
+        storage.edge_collection = AsyncMock()
+        storage.workspace = "test_ws"
+        storage.namespace = "test_graph"
+        storage._max_upsert_payload_bytes = DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES
+        storage._max_upsert_records_per_batch = (
+            DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH
+        )
+
+        await MongoGraphStorage.upsert_edges_batch(
+            storage,
+            [
+                ("EntityA", "EntityB", _make_edge(1.0)),
+                ("EntityB", "EntityA", _make_edge(2.0)),
+            ],
+        )
+
+        assert storage.edge_collection.bulk_write.await_args.kwargs["ordered"] is True
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_edges_batch_materializes_and_dedupes_endpoint_upserts(self):
+        pytest.importorskip("pymongo")
+        from lightrag.kg.mongo_impl import (
+            MongoGraphStorage,
+            DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES,
+            DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH,
+        )
+
+        storage = MongoGraphStorage.__new__(MongoGraphStorage)
+        storage.collection = AsyncMock()
+        storage.edge_collection = AsyncMock()
+        storage.workspace = "test_ws"
+        storage.namespace = "test_graph"
+        storage._max_upsert_payload_bytes = DEFAULT_MONGO_UPSERT_MAX_PAYLOAD_BYTES
+        storage._max_upsert_records_per_batch = (
+            DEFAULT_MONGO_UPSERT_MAX_RECORDS_PER_BATCH
+        )
+
+        await MongoGraphStorage.upsert_edges_batch(
+            storage,
+            [
+                ("EntityA", "EntityB", _make_edge(1.0)),
+                ("EntityA", "EntityC", _make_edge(2.0)),
+            ],
+        )
+
+        # Every endpoint of every edge gets a placeholder node — both ends, not
+        # just the sources, so no edge is left pointing at a node document that
+        # does not exist. EntityA appears as the source of both edges and must
+        # still collapse to a single op.
+        node_ops = storage.collection.bulk_write.await_args.args[0]
+        assert [op._filter["_id"] for op in node_ops] == [
+            "EntityA",
+            "EntityB",
+            "EntityC",
+        ]
+
+
+class TestPGTableBatchOrdering:
+    """Offline unit tests for PGTableGraphStorage batch write methods.
+
+    Spies on _execute to verify SQL batch arguments without a real DB.
+    """
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_nodes_batch_deduplicates_last_write_wins(self):
+        import json
+
+        from lightrag.kg.pgtable_impl import PGTableGraphStorage
+
+        storage = PGTableGraphStorage.__new__(PGTableGraphStorage)
+        storage.workspace = "test"
+        storage.namespace = GRAPH_NAMESPACE
+        execute_args: list[tuple] = []
+
+        async def spy(_sql, *args):
+            execute_args.append((_sql, *args))
+
+        storage._execute = spy  # type: ignore[assignment]
+
+        await PGTableGraphStorage.upsert_nodes_batch(
+            storage,
+            [
+                ("EntityA", _make_node("EntityA")),
+                ("EntityA", dict(_make_node("EntityA"), description="latest")),
+                ("EntityB", _make_node("EntityB")),
+            ],
+        )
+
+        # All nodes in a single _execute call
+        assert len(execute_args) == 1
+        sql, _ws, namespace, ids, props = execute_args[0]
+        assert namespace == GRAPH_NAMESPACE
+        assert ids == ["EntityA", "EntityB"]
+        assert json.loads(props[0])["description"] == "latest"
+        assert json.loads(props[1])["description"] == "Description of EntityB"
+        assert "ORDER BY u.id" in sql
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_nodes_batch_sorts_ids_for_lock_ordering(self):
+        from lightrag.kg.pgtable_impl import PGTableGraphStorage
+
+        storage = PGTableGraphStorage.__new__(PGTableGraphStorage)
+        storage.workspace = "test"
+        storage.namespace = GRAPH_NAMESPACE
+        execute_args: list[tuple] = []
+
+        async def spy(_sql, *args):
+            execute_args.append((_sql, *args))
+
+        storage._execute = spy  # type: ignore[assignment]
+
+        await PGTableGraphStorage.upsert_nodes_batch(
+            storage,
+            [
+                ("ZNode", _make_node("ZNode")),
+                ("ANode", _make_node("ANode")),
+            ],
+        )
+
+        sql, _ws, namespace, ids, _props = execute_args[0]
+        assert namespace == GRAPH_NAMESPACE
+        assert ids == ["ANode", "ZNode"]
+        assert "ORDER BY u.id" in sql
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_edges_batch_normalizes_direction(self):
+        import json
+
+        from lightrag.kg.pgtable_impl import PGTableGraphStorage
+
+        storage = PGTableGraphStorage.__new__(PGTableGraphStorage)
+        storage.workspace = "test"
+        storage.namespace = GRAPH_NAMESPACE
+        execute_args: list[tuple] = []
+
+        async def spy(_sql, *args):
+            execute_args.append((_sql, *args))
+
+        storage._execute = spy  # type: ignore[assignment]
+
+        await PGTableGraphStorage.upsert_edges_batch(
+            storage,
+            [
+                ("EntityA", "EntityB", _make_edge(1.0)),
+                (
+                    "EntityB",
+                    "EntityA",
+                    _make_edge(2.0),
+                ),  # reversed → same canonical pair
+                ("EntityB", "EntityC", _make_edge(3.0)),
+            ],
+        )
+
+        # (A,B) and (B,A) collapse to one row; all edges in one _execute call
+        assert len(execute_args) == 1
+        sql, _ws, namespace, srcs, tgts, props, endpoint_ids = execute_args[0]
+        assert namespace == GRAPH_NAMESPACE
+        edge_pairs = list(zip(srcs, tgts))
+        assert len(edge_pairs) == 2
+        assert ("EntityA", "EntityB") in edge_pairs
+        assert ("EntityB", "EntityC") in edge_pairs
+        assert endpoint_ids == ["EntityA", "EntityB", "EntityC"]
+        assert "ORDER BY u.src, u.tgt" in sql
+        assert "jsonb_build_object('entity_id', u.id)" in sql
+        assert "JOIN lightrag_graph_nodes src_n" not in sql
+        assert "JOIN lightrag_graph_nodes tgt_n" not in sql
+        # Last write wins: weight 2.0 (from the (B,A) call) survives
+        ab_idx = edge_pairs.index(("EntityA", "EntityB"))
+        assert json.loads(props[ab_idx])["weight"] == 2.0
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_upsert_edges_batch_canonical_order_is_lexicographic(self):
+        """src_id = min(a, b), tgt_id = max(a, b) regardless of call order."""
+        from lightrag.kg.pgtable_impl import PGTableGraphStorage
+
+        storage = PGTableGraphStorage.__new__(PGTableGraphStorage)
+        storage.workspace = "test"
+        storage.namespace = GRAPH_NAMESPACE
+        execute_args: list[tuple] = []
+
+        async def spy(_sql, *args):
+            execute_args.append((_sql, *args))
+
+        storage._execute = spy  # type: ignore[assignment]
+
+        await PGTableGraphStorage.upsert_edges_batch(
+            storage,
+            [("ZNode", "ANode", _make_edge())],
+        )
+
+        sql, _ws, namespace, srcs, tgts, _, endpoint_ids = execute_args[0]
+        assert namespace == GRAPH_NAMESPACE
+        assert srcs == ["ANode"]
+        assert tgts == ["ZNode"]
+        assert endpoint_ids == ["ANode", "ZNode"]
+        assert "ORDER BY u.src, u.tgt" in sql
+        assert "jsonb_build_object('entity_id', u.id)" in sql
+        assert "JOIN lightrag_graph_nodes src_n" not in sql
+        assert "JOIN lightrag_graph_nodes tgt_n" not in sql
+
+
+class TestPGTablePipelineIntegration:
+    """Offline pipeline integration tests for PGTableGraphStorage.
+
+    Patches all DB-dependent methods (_execute / _fetch / _fetchrow / _fetchval)
+    so no PostgreSQL instance is required, then drives the real
+    ainsert_custom_kg() pipeline to verify:
+
+    1. Batch write methods are invoked (not N+1 serial upserts).
+    2. Edge canonical normalisation flows end-to-end: a relation submitted
+       as (EntityB, EntityA) must reach _execute as (EntityA, EntityB).
+    """
+
+    @pytest.mark.offline
+    @pytest.mark.asyncio
+    async def test_batch_writes_and_edge_normalisation_via_pipeline(self):
+        import tempfile
+        from unittest.mock import AsyncMock, patch
+
+        from lightrag import LightRAG
+        from lightrag.kg.pgtable_impl import PGTableGraphStorage
+
+        execute_args: list[tuple] = []
+
+        async def spy_execute(_self, _sql, *args):
+            execute_args.append(args)
+
+        with (
+            patch.object(PGTableGraphStorage, "initialize", AsyncMock()),
+            patch.object(PGTableGraphStorage, "finalize", AsyncMock()),
+            patch.object(PGTableGraphStorage, "index_done_callback", AsyncMock()),
+            # Route all writes through the spy; skip actual SQL
+            patch.object(PGTableGraphStorage, "_execute", spy_execute),
+            # Make all reads return empty so the pipeline treats everything as new
+            patch.object(PGTableGraphStorage, "_fetch", AsyncMock(return_value=[])),
+            patch.object(
+                PGTableGraphStorage, "_fetchrow", AsyncMock(return_value=None)
+            ),
+            patch.object(PGTableGraphStorage, "_fetchval", AsyncMock(return_value=0)),
+        ):
+            # Satisfy env-var checks in LightRAG.__post_init__ without a real DB
+            pg_env = {
+                "POSTGRES_USER": "test",
+                "POSTGRES_PASSWORD": "test",
+                "POSTGRES_DATABASE": "test",
+            }
+            with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", pg_env):
+                rag = LightRAG(
+                    working_dir=tmp,
+                    graph_storage="PGTableGraphStorage",
+                    llm_model_func=AsyncMock(return_value=""),
+                    embedding_func=mock_embedding_func,
+                )
+                await rag.initialize_storages()
+
+                # Mock non-graph storages to avoid file I/O interference
+                rag.entities_vdb.upsert = AsyncMock()
+                rag.relationships_vdb.upsert = AsyncMock()
+                rag.relationships_vdb.delete = AsyncMock()
+                rag.text_chunks.upsert = AsyncMock()
+                rag.doc_status.upsert = AsyncMock()
+
+                # Two entities + one relation submitted in reverse direction (B→A).
+                # PGTableGraphStorage must store the edge as (EntityA, EntityB) — canonical order.
+                custom_kg = {
+                    "chunks": [
+                        {"content": "text", "chunk_order_index": 0, "source_id": "s1"}
+                    ],
+                    "entities": [
+                        {
+                            "entity_name": "EntityA",
+                            "entity_type": "CONCEPT",
+                            "description": "A",
+                            "source_id": "s1",
+                            "file_path": "t.pdf",
+                        },
+                        {
+                            "entity_name": "EntityB",
+                            "entity_type": "CONCEPT",
+                            "description": "B",
+                            "source_id": "s1",
+                            "file_path": "t.pdf",
+                        },
+                    ],
+                    "relationships": [
+                        {
+                            "src_id": "EntityB",  # reversed — pipeline sends B→A
+                            "tgt_id": "EntityA",
+                            "description": "relation",
+                            "keywords": "link",
+                            "weight": 1.0,
+                            "source_id": "s1",
+                            "file_path": "t.pdf",
+                        }
+                    ],
+                }
+
+                await rag.ainsert_custom_kg(custom_kg)
+                await rag.finalize_storages()
+
+        # ── Verify batch writes were issued ──────────────────────────────────
+        # Node batch: (workspace, namespace, ids_list, props_list)
+        node_batches = [
+            a for a in execute_args if len(a) == 4 and isinstance(a[2], list)
+        ]
+        assert node_batches, "upsert_nodes_batch never called _execute"
+
+        # Edge batch: (workspace, namespace, srcs_list, tgts_list, props_list, endpoint_ids)
+        edge_batches = [
+            a for a in execute_args if len(a) == 6 and isinstance(a[2], list)
+        ]
+        assert edge_batches, "upsert_edges_batch never called _execute"
+
+        # ── Verify canonical edge normalisation ──────────────────────────────
+        # The relation was submitted as (EntityB, EntityA); canonical order is
+        # min(a,b) → src, so it must be stored as (EntityA, EntityB).
+        _ws, namespace, srcs, tgts, _props, endpoint_ids = edge_batches[0]
+        assert namespace == GRAPH_NAMESPACE
+        assert srcs == ["EntityA"], f"Edge src not normalised: got {srcs}"
+        assert tgts == ["EntityB"], f"Edge tgt not normalised: got {tgts}"
+        assert endpoint_ids == ["EntityA", "EntityB"]

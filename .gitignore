@@ -1,0 +1,6 @@
+# Local learning logs (per-developer; see self-improvement skill)
+.learnings/
+
+# Environment / secrets - do not commit
+.env
+*.log
