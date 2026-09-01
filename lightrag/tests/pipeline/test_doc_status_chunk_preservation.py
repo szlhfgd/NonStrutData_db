@@ -1,0 +1,2413 @@
+import asyncio
+from datetime import datetime, timezone
+from types import MethodType
+from uuid import uuid4
+
+import numpy as np
+import pytest
+
+import lightrag.lightrag as lightrag_module
+import lightrag.pipeline as pipeline_module
+from lightrag.base import DocStatus
+from lightrag.constants import (
+    GRAPH_FIELD_SEP,
+    KG_WRITE_STATE_METADATA_KEY,
+    KG_WRITE_STATE_PRE_GRAPH,
+)
+from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
+from lightrag.lightrag import LightRAG
+
+from .conftest import request_failed_retry
+from lightrag.utils import (
+    EmbeddingFunc,
+    Tokenizer,
+    compute_mdhash_id,
+    make_relation_chunk_key,
+)
+
+pytestmark = pytest.mark.offline
+
+
+class _SimpleTokenizerImpl:
+    def encode(self, content: str) -> list[int]:
+        return [ord(ch) for ch in content]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(chr(t) for t in tokens)
+
+
+async def _dummy_embedding(texts: list[str]) -> np.ndarray:
+    return np.ones((len(texts), 8), dtype=float)
+
+
+async def _dummy_llm(*args, **kwargs) -> str:
+    return "ok"
+
+
+def _deterministic_chunking(
+    tokenizer,
+    content: str,
+    split_by_character,
+    split_by_character_only: bool,
+    chunk_overlap_token_size: int,
+    chunk_token_size: int,
+) -> list[dict]:
+    return [
+        {"tokens": 1, "content": f"{content}::chunk1", "chunk_order_index": 0},
+        {"tokens": 1, "content": f"{content}::chunk2", "chunk_order_index": 1},
+    ]
+
+
+def _failing_chunking(
+    tokenizer,
+    content: str,
+    split_by_character,
+    split_by_character_only: bool,
+    chunk_overlap_token_size: int,
+    chunk_token_size: int,
+) -> list[dict]:
+    raise RuntimeError("chunking fail sentinel")
+
+
+def _status_to_text(status: object) -> str:
+    if isinstance(status, DocStatus):
+        return status.value
+    return str(status).replace("DocStatus.", "").lower()
+
+
+async def _build_rag(
+    tmp_path,
+    test_name: str,
+    chunking_func,
+    *,
+    max_parallel_insert: int = 1,
+) -> LightRAG:
+    workspace = f"{test_name}_{uuid4().hex[:8]}"
+    rag = LightRAG(
+        working_dir=str(tmp_path / test_name),
+        workspace=workspace,
+        llm_model_func=_dummy_llm,
+        embedding_func=EmbeddingFunc(
+            embedding_dim=8,
+            max_token_size=8192,
+            func=_dummy_embedding,
+        ),
+        tokenizer=Tokenizer("test-tokenizer", _SimpleTokenizerImpl()),
+        chunking_func=chunking_func,
+        max_parallel_insert=max_parallel_insert,
+    )
+    await rag.initialize_storages()
+    return rag
+
+
+async def _seed_chunk_cache_entries(
+    rag: LightRAG, chunk_ids: list[str], prefix: str
+) -> list[str]:
+    updates = {}
+    cache_records = {}
+    cache_ids: list[str] = []
+
+    for idx, chunk_id in enumerate(chunk_ids):
+        chunk_data = await rag.text_chunks.get_by_id(chunk_id)
+        assert chunk_data is not None
+        cache_id = f"{prefix}-cache-{idx}"
+        chunk_data["llm_cache_list"] = [cache_id]
+        updates[chunk_id] = chunk_data
+        cache_records[cache_id] = {"cache_type": "extract", "return": f"cached-{idx}"}
+        cache_ids.append(cache_id)
+
+    await rag.text_chunks.upsert(updates)
+    await rag.llm_response_cache.upsert(cache_records)
+    return cache_ids
+
+
+async def _seed_delete_retry_state(
+    rag: LightRAG,
+    *,
+    doc_id: str,
+    status_chunk_ids: list[str],
+    tracking_chunk_ids: list[str],
+    chunk_owners: dict[str, str],
+    metadata: dict | None = None,
+) -> dict[str, str]:
+    entity_a = "ENTITY-A"
+    entity_b = "ENTITY-B"
+    relation_key = make_relation_chunk_key(entity_a, entity_b)
+    source_id = GRAPH_FIELD_SEP.join(tracking_chunk_ids)
+    now = datetime.now(timezone.utc).isoformat()
+
+    await rag.full_docs.upsert(
+        {doc_id: {"content": "delete retry state doc", "file_path": "delete_retry.txt"}}
+    )
+    await rag.doc_status.upsert(
+        {
+            doc_id: {
+                "status": DocStatus.PROCESSED,
+                "content_summary": "delete retry state",
+                "content_length": 22,
+                "chunks_count": len(status_chunk_ids),
+                "chunks_list": status_chunk_ids,
+                "created_at": now,
+                "updated_at": now,
+                "file_path": "delete_retry.txt",
+                "track_id": f"track-{doc_id}",
+                "error_msg": "",
+                "metadata": metadata or {},
+            }
+        }
+    )
+
+    chunk_payload = {}
+    for chunk_id, owner_doc_id in chunk_owners.items():
+        chunk_payload[chunk_id] = {
+            "content": f"{chunk_id} content",
+            "file_path": f"{chunk_id}.txt",
+            "full_doc_id": owner_doc_id,
+        }
+
+    if chunk_payload:
+        await rag.text_chunks.upsert(chunk_payload)
+        await rag.chunks_vdb.upsert(chunk_payload)
+
+    await rag.full_entities.upsert({doc_id: {"entity_names": [entity_a, entity_b]}})
+    await rag.full_relations.upsert(
+        {doc_id: {"relation_pairs": [(entity_a, entity_b)]}}
+    )
+    await rag.entity_chunks.upsert(
+        {
+            entity_a: {
+                "chunk_ids": tracking_chunk_ids,
+                "count": len(tracking_chunk_ids),
+            },
+            entity_b: {
+                "chunk_ids": tracking_chunk_ids,
+                "count": len(tracking_chunk_ids),
+            },
+        }
+    )
+    await rag.relation_chunks.upsert(
+        {
+            relation_key: {
+                "chunk_ids": tracking_chunk_ids,
+                "count": len(tracking_chunk_ids),
+            }
+        }
+    )
+
+    created_at = int(datetime.now(timezone.utc).timestamp())
+    for entity_name in [entity_a, entity_b]:
+        await rag.chunk_entity_relation_graph.upsert_node(
+            entity_name,
+            {
+                "entity_id": entity_name,
+                "source_id": source_id,
+                "description": f"{entity_name} description",
+                "entity_type": "test",
+                "file_path": "delete_retry.txt",
+                "created_at": created_at,
+                "truncate": "",
+            },
+        )
+
+    await rag.chunk_entity_relation_graph.upsert_edge(
+        entity_a,
+        entity_b,
+        {
+            "source": entity_a,
+            "target": entity_b,
+            "source_id": source_id,
+            "description": "related",
+            "keywords": "test",
+            "weight": 1.0,
+            "file_path": "delete_retry.txt",
+        },
+    )
+
+    await rag.entities_vdb.upsert(
+        {
+            compute_mdhash_id(entity_a, prefix="ent-"): {
+                "content": f"{entity_a}\n{entity_a} description",
+                "entity_name": entity_a,
+                "source_id": source_id,
+                "description": f"{entity_a} description",
+                "entity_type": "test",
+                "file_path": "delete_retry.txt",
+            },
+            compute_mdhash_id(entity_b, prefix="ent-"): {
+                "content": f"{entity_b}\n{entity_b} description",
+                "entity_name": entity_b,
+                "source_id": source_id,
+                "description": f"{entity_b} description",
+                "entity_type": "test",
+                "file_path": "delete_retry.txt",
+            },
+        }
+    )
+    await rag.relationships_vdb.upsert(
+        {
+            compute_mdhash_id(entity_a + entity_b, prefix="rel-"): {
+                "content": f"test\t{entity_a}\n{entity_b}\nrelated",
+                "src_id": entity_a,
+                "tgt_id": entity_b,
+                "source_id": source_id,
+                "description": "related",
+                "keywords": "test",
+                "weight": 1.0,
+                "file_path": "delete_retry.txt",
+            }
+        }
+    )
+
+    return {
+        "entity_a": entity_a,
+        "entity_b": entity_b,
+        "relation_key": relation_key,
+    }
+
+
+async def _succeed_rebuild_from_remaining_chunks(
+    entities_to_rebuild,
+    relationships_to_rebuild,
+    knowledge_graph_inst,
+    entities_vdb,
+    relationships_vdb,
+    **kwargs,
+):
+    for entity_name, remaining_chunk_ids in entities_to_rebuild.items():
+        node = await knowledge_graph_inst.get_node(entity_name)
+        assert node is not None
+        updated_node = {
+            **node,
+            "source_id": GRAPH_FIELD_SEP.join(remaining_chunk_ids),
+        }
+        await knowledge_graph_inst.upsert_node(entity_name, updated_node)
+        await entities_vdb.upsert(
+            {
+                compute_mdhash_id(entity_name, prefix="ent-"): {
+                    "content": f"{entity_name}\n{updated_node['description']}",
+                    "entity_name": entity_name,
+                    "source_id": updated_node["source_id"],
+                    "description": updated_node["description"],
+                    "entity_type": updated_node["entity_type"],
+                    "file_path": updated_node["file_path"],
+                }
+            }
+        )
+
+    for (src, tgt), remaining_chunk_ids in relationships_to_rebuild.items():
+        edge = await knowledge_graph_inst.get_edge(src, tgt)
+        assert edge is not None
+        updated_edge = {
+            **edge,
+            "source_id": GRAPH_FIELD_SEP.join(remaining_chunk_ids),
+        }
+        await knowledge_graph_inst.upsert_edge(src, tgt, updated_edge)
+        await relationships_vdb.upsert(
+            {
+                compute_mdhash_id(src + tgt, prefix="rel-"): {
+                    "content": f"{updated_edge['keywords']}\t{src}\n{tgt}\n{updated_edge['description']}",
+                    "src_id": src,
+                    "tgt_id": tgt,
+                    "source_id": updated_edge["source_id"],
+                    "description": updated_edge["description"],
+                    "keywords": updated_edge["keywords"],
+                    "weight": updated_edge["weight"],
+                    "file_path": updated_edge["file_path"],
+                }
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_failure_preserves_chunks_and_allows_delete_with_cache_cleanup(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(tmp_path, "extract_failure_cleanup", _deterministic_chunking)
+    try:
+        content = "extract failure document"
+        file_path = "extract_failure.txt"
+        doc_id = compute_mdhash_id(file_path, prefix="doc-")
+        await rag.apipeline_enqueue_documents(input=content, file_paths=file_path)
+
+        async def fail_extract(self, chunks, pipeline_status, pipeline_status_lock):
+            raise RuntimeError("extract fail sentinel")
+
+        rag._process_extract_entities = MethodType(fail_extract, rag)
+
+        await rag.apipeline_process_enqueue_documents()
+
+        doc_status = await rag.doc_status.get_by_id(doc_id)
+        assert doc_status is not None
+        assert _status_to_text(doc_status["status"]) == "failed"
+        chunk_ids = doc_status.get("chunks_list", [])
+        assert len(chunk_ids) == 2
+        assert doc_status.get("chunks_count") == 2
+
+        cache_ids = await _seed_chunk_cache_entries(rag, chunk_ids, "extract")
+
+        result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+        assert result.status == "success"
+
+        deleted_chunks = await rag.text_chunks.get_by_ids(chunk_ids)
+        assert all(item is None for item in deleted_chunks)
+        deleted_cache = [
+            await rag.llm_response_cache.get_by_id(cid) for cid in cache_ids
+        ]
+        assert all(item is None for item in deleted_cache)
+        assert await rag.doc_status.get_by_id(doc_id) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_extract_failure_keeps_the_processing_attempt_metadata(
+    tmp_path,
+):
+    """A FAILED row must describe the attempt as fully as a PROCESSED one.
+
+    ``extraction_meta`` (parse_format / parse_engine / chunk_method, plus
+    mm_chunks and friends) is stamped when the document enters PROCESSING, and
+    none of those keys is in ``_DOC_STATUS_METADATA_CARRY_OVER_KEYS`` — so the
+    FAILED transition has to re-pass them or they are dropped. The merge-stage
+    failure path always did; the extract-stage one did not, which left a
+    document that failed EARLIER describing itself LESS than one that failed
+    a stage later.
+    """
+    rag = await _build_rag(tmp_path, "extract_failure_meta", _deterministic_chunking)
+    try:
+        file_path = "extract_failure_meta.txt"
+        doc_id = compute_mdhash_id(file_path, prefix="doc-")
+        await rag.apipeline_enqueue_documents(
+            input="extract failure metadata document", file_paths=file_path
+        )
+
+        processing_metadata: dict = {}
+        original_transition = rag._upsert_doc_status_transition
+
+        async def _capture_transition(*args, status=None, **kwargs):
+            if status == DocStatus.PROCESSING:
+                processing_metadata.update(kwargs.get("metadata_extra") or {})
+            return await original_transition(*args, status=status, **kwargs)
+
+        rag._upsert_doc_status_transition = _capture_transition
+
+        async def fail_extract(
+            self, chunks, pipeline_status, pipeline_status_lock, **_
+        ):
+            raise RuntimeError("extract fail sentinel")
+
+        rag._process_extract_entities = MethodType(fail_extract, rag)
+
+        await rag.apipeline_process_enqueue_documents()
+
+        doc_status = await rag.doc_status.get_by_id(doc_id)
+        assert _status_to_text(doc_status["status"]) == "failed"
+        metadata = doc_status["metadata"]
+
+        # Everything PROCESSING recorded about how this attempt was run
+        # survives the failure, unchanged.
+        assert processing_metadata, "the PROCESSING transition wrote no metadata"
+        for key, value in processing_metadata.items():
+            assert metadata.get(key) == value, f"{key} was dropped by the FAILED write"
+        # Sanity: those are the descriptive fields, not just the timestamps.
+        assert {"parse_format", "chunk_method"} <= set(metadata)
+        # ...alongside the failure's own bookkeeping.
+        assert metadata["process_end_time"] >= metadata["process_start_time"]
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_extract_failure_before_chunking_clears_stale_chunk_snapshot(
+    tmp_path,
+):
+    """The resume branch of ``apipeline_process_enqueue_documents`` purges
+    any stale ``chunks_list`` from a previous interrupted run *before*
+    chunking starts (so the new run does not mix old and new chunks).
+    Therefore, when chunking subsequently fails on the retry, the failed
+    doc_status reflects the post-purge state — the previous snapshot is
+    intentionally not preserved any more.
+
+    Earlier this test asserted the opposite ("preserve previous snapshot
+    across failure"), which conflicted with the documented resume rule
+    that "已抽取文档一律删掉所有的文本块，重新走多模态分析和实体关系提取".
+    """
+    rag = await _build_rag(tmp_path, "extract_failure_pre_chunking", _failing_chunking)
+    try:
+        content = "chunking failure document"
+        file_path = "chunking_failure.txt"
+        doc_id = compute_mdhash_id(file_path, prefix="doc-")
+        await rag.apipeline_enqueue_documents(input=content, file_paths=file_path)
+
+        previous_chunks = ["chunk-old-1", "chunk-old-2", "chunk-old-3"]
+        existing = await rag.doc_status.get_by_id(doc_id)
+        assert existing is not None
+        await rag.doc_status.upsert(
+            {
+                doc_id: {
+                    "status": DocStatus.FAILED,
+                    "content_summary": existing["content_summary"],
+                    "content_length": existing["content_length"],
+                    "chunks_count": len(previous_chunks),
+                    "chunks_list": previous_chunks,
+                    "created_at": existing["created_at"],
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "file_path": existing["file_path"],
+                    "track_id": existing["track_id"],
+                    "error_msg": "previous failure",
+                    # kg_write_state is carried across every real status
+                    # transition (it is in the carry-over whitelist), and this
+                    # document failed before merge — so a real FAILED row still
+                    # proves it never reached the graph. The resume purge needs
+                    # that proof to clean up the stale chunk snapshot.
+                    "metadata": {
+                        "source": "test",
+                        KG_WRITE_STATE_METADATA_KEY: KG_WRITE_STATE_PRE_GRAPH,
+                    },
+                }
+            }
+        )
+
+        # FAILED docs re-enter only via an explicit manual retry request
+        # (the /reprocess_failed semantics).
+        await request_failed_retry(rag)
+        await rag.apipeline_process_enqueue_documents()
+
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+        assert failed_status is not None
+        assert _status_to_text(failed_status["status"]) == "failed"
+        # Resume purged the stale list before chunking; the failure record
+        # therefore shows zero chunks rather than the previous snapshot.
+        assert failed_status.get("chunks_list") == []
+        assert failed_status.get("chunks_count") == 0
+        assert "chunking fail sentinel" in (failed_status.get("error_msg") or "")
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_merge_failure_preserves_chunks_and_skip_cache_cleanup_when_disabled(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path, "merge_failure_keep_cache", _deterministic_chunking
+    )
+    try:
+        content = "merge failure document"
+        file_path = "merge_failure.txt"
+        doc_id = compute_mdhash_id(file_path, prefix="doc-")
+        await rag.apipeline_enqueue_documents(input=content, file_paths=file_path)
+
+        async def ok_extract(self, chunks, pipeline_status, pipeline_status_lock):
+            return {"chunk_count": len(chunks)}
+
+        async def fail_merge(**kwargs):
+            raise RuntimeError("merge fail sentinel")
+
+        rag._process_extract_entities = MethodType(ok_extract, rag)
+        monkeypatch.setattr(pipeline_module, "merge_nodes_and_edges", fail_merge)
+
+        await rag.apipeline_process_enqueue_documents()
+
+        doc_status = await rag.doc_status.get_by_id(doc_id)
+        assert doc_status is not None
+        assert _status_to_text(doc_status["status"]) == "failed"
+        chunk_ids = doc_status.get("chunks_list", [])
+        assert len(chunk_ids) == 2
+        assert doc_status.get("chunks_count") == 2
+
+        cache_ids = await _seed_chunk_cache_entries(rag, chunk_ids, "merge")
+        result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=False)
+        assert result.status == "success"
+
+        remaining_cache = [
+            await rag.llm_response_cache.get_by_id(cid) for cid in cache_ids
+        ]
+        assert all(item is not None for item in remaining_cache)
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_rebuild_failure_prunes_chunk_tracking_before_abort(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path, "delete_rebuild_failure_chunk_tracking", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-rebuild-failure"
+        keep_chunk_id = "chunk-keep"
+        drop_chunk_id = "chunk-drop"
+        seeded = await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[keep_chunk_id, drop_chunk_id],
+            chunk_owners={
+                keep_chunk_id: "doc-keep",
+                drop_chunk_id: doc_id,
+            },
+        )
+        entity_a = seeded["entity_a"]
+        entity_b = seeded["entity_b"]
+        relation_key = seeded["relation_key"]
+
+        async def fail_rebuild(**kwargs):
+            raise RuntimeError("rebuild fail sentinel")
+
+        monkeypatch.setattr(
+            lightrag_module, "rebuild_knowledge_from_chunks", fail_rebuild
+        )
+
+        result = await rag.adelete_by_doc_id(doc_id)
+
+        entity_tracking = await rag.entity_chunks.get_by_id(entity_a)
+        relation_tracking = await rag.relation_chunks.get_by_id(relation_key)
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+
+        assert result.status == "fail"
+        assert "rebuild fail sentinel" in result.message
+        # Safe destructive ordering: the chunks are deleted only AFTER every
+        # derived contribution is repaired or removed, so a rebuild failure
+        # leaves them in place and the retry can still rebuild from them.
+        # This used to assert the chunk was already gone — the window where
+        # graph objects pointed at chunks that no longer existed (issue #3400).
+        assert await rag.text_chunks.get_by_id(drop_chunk_id) is not None
+        assert await rag.text_chunks.get_by_id(keep_chunk_id) is not None
+        assert failed_status is not None
+        assert failed_status["chunks_list"] == [drop_chunk_id]
+        assert failed_status["metadata"]["deletion_failed"] is True
+        assert (
+            failed_status["metadata"]["deletion_failure_stage"]
+            == "rebuild_knowledge_graph"
+        )
+        assert "rebuild fail sentinel" in failed_status["error_msg"]
+        assert entity_tracking is not None
+        assert entity_tracking["chunk_ids"] == [keep_chunk_id]
+        assert entity_tracking["count"] == 1
+        assert relation_tracking is not None
+        assert relation_tracking["chunk_ids"] == [keep_chunk_id]
+        assert relation_tracking["count"] == 1
+        assert (
+            await rag.chunk_entity_relation_graph.get_edge(entity_a, entity_b)
+            is not None
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_succeeds_after_rebuild_failure(tmp_path, monkeypatch):
+    rag = await _build_rag(
+        tmp_path, "delete_retry_after_failure", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-retry-success"
+        keep_chunk_id = "chunk-keep"
+        drop_chunk_id = "chunk-drop"
+        seeded = await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[keep_chunk_id, drop_chunk_id],
+            chunk_owners={
+                keep_chunk_id: "doc-keep",
+                drop_chunk_id: doc_id,
+            },
+        )
+        entity_a = seeded["entity_a"]
+        entity_b = seeded["entity_b"]
+        relation_key = seeded["relation_key"]
+
+        async def fail_rebuild(**kwargs):
+            raise RuntimeError("rebuild fail sentinel")
+
+        monkeypatch.setattr(
+            lightrag_module, "rebuild_knowledge_from_chunks", fail_rebuild
+        )
+        first_result = await rag.adelete_by_doc_id(doc_id)
+        assert first_result.status == "fail"
+
+        monkeypatch.setattr(
+            lightrag_module,
+            "rebuild_knowledge_from_chunks",
+            _succeed_rebuild_from_remaining_chunks,
+        )
+        second_result = await rag.adelete_by_doc_id(doc_id)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.full_entities.get_by_id(doc_id) is None
+        assert await rag.full_relations.get_by_id(doc_id) is None
+        assert await rag.text_chunks.get_by_id(drop_chunk_id) is None
+        assert await rag.text_chunks.get_by_id(keep_chunk_id) is not None
+
+        entity_a_tracking = await rag.entity_chunks.get_by_id(entity_a)
+        entity_b_tracking = await rag.entity_chunks.get_by_id(entity_b)
+        relation_tracking = await rag.relation_chunks.get_by_id(relation_key)
+        edge = await rag.chunk_entity_relation_graph.get_edge(entity_a, entity_b)
+
+        assert entity_a_tracking is not None
+        assert entity_a_tracking["chunk_ids"] == [keep_chunk_id]
+        assert entity_b_tracking is not None
+        assert entity_b_tracking["chunk_ids"] == [keep_chunk_id]
+        assert relation_tracking is not None
+        assert relation_tracking["chunk_ids"] == [keep_chunk_id]
+        assert edge is not None
+        assert edge["source_id"] == keep_chunk_id
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_cleans_llm_cache_after_rebuild_failure(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path, "delete_retry_cleans_llm_cache", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-retry-cache-cleanup"
+        keep_chunk_id = "chunk-keep"
+        drop_chunk_id = "chunk-drop"
+        seeded = await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[keep_chunk_id, drop_chunk_id],
+            chunk_owners={
+                keep_chunk_id: "doc-keep",
+                drop_chunk_id: doc_id,
+            },
+        )
+        entity_a = seeded["entity_a"]
+        entity_b = seeded["entity_b"]
+        cache_ids = await _seed_chunk_cache_entries(rag, [drop_chunk_id], "retry")
+
+        async def fail_rebuild(**kwargs):
+            raise RuntimeError("rebuild fail sentinel")
+
+        monkeypatch.setattr(
+            lightrag_module, "rebuild_knowledge_from_chunks", fail_rebuild
+        )
+        first_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+        assert first_result.status == "fail"
+
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+        assert failed_status is not None
+        assert failed_status["metadata"]["deletion_llm_cache_ids"] == cache_ids
+        # Safe destructive ordering: the chunks are deleted only AFTER every
+        # derived contribution is repaired or removed, so a rebuild failure
+        # leaves them in place and the retry can still rebuild from them.
+        # This used to assert the chunk was already gone — the window where
+        # graph objects pointed at chunks that no longer existed (issue #3400).
+        assert await rag.text_chunks.get_by_id(drop_chunk_id) is not None
+
+        monkeypatch.setattr(
+            lightrag_module,
+            "rebuild_knowledge_from_chunks",
+            _succeed_rebuild_from_remaining_chunks,
+        )
+        second_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.llm_response_cache.get_by_id(cache_ids[0]) is None
+        edge = await rag.chunk_entity_relation_graph.get_edge(entity_a, entity_b)
+        assert edge is not None
+        assert edge["source_id"] == keep_chunk_id
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_cleans_llm_cache_when_enabled_on_retry(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path, "delete_retry_cache_cleanup_flag_change", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-retry-cache-flag-change"
+        keep_chunk_id = "chunk-keep"
+        drop_chunk_id = "chunk-drop"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[keep_chunk_id, drop_chunk_id],
+            chunk_owners={
+                keep_chunk_id: "doc-keep",
+                drop_chunk_id: doc_id,
+            },
+        )
+        cache_ids = await _seed_chunk_cache_entries(rag, [drop_chunk_id], "retry-flag")
+
+        async def fail_rebuild(**kwargs):
+            raise RuntimeError("rebuild fail sentinel")
+
+        monkeypatch.setattr(
+            lightrag_module, "rebuild_knowledge_from_chunks", fail_rebuild
+        )
+        first_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=False)
+
+        assert first_result.status == "fail"
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+        assert failed_status is not None
+        assert failed_status["metadata"]["deletion_llm_cache_ids"] == cache_ids
+        # Safe destructive ordering: the chunks are deleted only AFTER every
+        # derived contribution is repaired or removed, so a rebuild failure
+        # leaves them in place and the retry can still rebuild from them.
+        # This used to assert the chunk was already gone — the window where
+        # graph objects pointed at chunks that no longer existed (issue #3400).
+        assert await rag.text_chunks.get_by_id(drop_chunk_id) is not None
+
+        monkeypatch.setattr(
+            lightrag_module,
+            "rebuild_knowledge_from_chunks",
+            _succeed_rebuild_from_remaining_chunks,
+        )
+        second_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.llm_response_cache.get_by_id(cache_ids[0]) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_collects_cache_ids_without_cache_storage(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path,
+        "delete_retry_collect_cache_ids_without_storage",
+        _deterministic_chunking,
+    )
+    try:
+        doc_id = "doc-delete-retry-collect-cache-ids"
+        keep_chunk_id = "chunk-keep"
+        drop_chunk_id = "chunk-drop"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[keep_chunk_id, drop_chunk_id],
+            chunk_owners={
+                keep_chunk_id: "doc-keep",
+                drop_chunk_id: doc_id,
+            },
+        )
+        cache_ids = await _seed_chunk_cache_entries(
+            rag, [drop_chunk_id], "collect-without-storage"
+        )
+
+        async def fail_rebuild(**kwargs):
+            raise RuntimeError("rebuild fail sentinel")
+
+        cache_storage = rag.llm_response_cache
+        rag.llm_response_cache = None
+        monkeypatch.setattr(
+            lightrag_module, "rebuild_knowledge_from_chunks", fail_rebuild
+        )
+        first_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=False)
+
+        assert first_result.status == "fail"
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+        assert failed_status is not None
+        assert failed_status["metadata"]["deletion_llm_cache_ids"] == cache_ids
+        # Safe destructive ordering: the chunks are deleted only AFTER every
+        # derived contribution is repaired or removed, so a rebuild failure
+        # leaves them in place and the retry can still rebuild from them.
+        # This used to assert the chunk was already gone — the window where
+        # graph objects pointed at chunks that no longer existed (issue #3400).
+        assert await rag.text_chunks.get_by_id(drop_chunk_id) is not None
+
+        rag.llm_response_cache = cache_storage
+        monkeypatch.setattr(
+            lightrag_module,
+            "rebuild_knowledge_from_chunks",
+            _succeed_rebuild_from_remaining_chunks,
+        )
+        second_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.llm_response_cache.get_by_id(cache_ids[0]) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_succeeds_after_llm_cache_cleanup_failure(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path, "delete_retry_after_cache_cleanup_failure", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-cache-cleanup-failure"
+        drop_chunk_id = "chunk-drop"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[drop_chunk_id],
+            chunk_owners={drop_chunk_id: doc_id},
+        )
+        cache_ids = await _seed_chunk_cache_entries(
+            rag, [drop_chunk_id], "cache-cleanup-failure"
+        )
+
+        async def fail_cache_delete(self, ids):
+            raise RuntimeError("llm cache delete fail sentinel")
+
+        monkeypatch.setattr(
+            rag.llm_response_cache,
+            "delete",
+            MethodType(fail_cache_delete, rag.llm_response_cache),
+        )
+        first_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert first_result.status == "fail"
+        assert "Failed to delete LLM cache" in first_result.message
+        assert await rag.doc_status.get_by_id(doc_id) is not None
+        assert await rag.full_docs.get_by_id(doc_id) is not None
+        assert await rag.llm_response_cache.get_by_id(cache_ids[0]) is not None
+
+        monkeypatch.undo()
+        second_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.llm_response_cache.get_by_id(cache_ids[0]) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_succeeds_after_silent_llm_cache_cleanup_failure(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path,
+        "delete_retry_after_silent_cache_cleanup_failure",
+        _deterministic_chunking,
+    )
+    try:
+        doc_id = "doc-delete-silent-cache-cleanup-failure"
+        drop_chunk_id = "chunk-drop"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[drop_chunk_id],
+            chunk_owners={drop_chunk_id: doc_id},
+        )
+        cache_ids = await _seed_chunk_cache_entries(
+            rag, [drop_chunk_id], "silent-cache-cleanup-failure"
+        )
+
+        async def silently_fail_cache_delete(self, ids):
+            return None
+
+        monkeypatch.setattr(
+            rag.llm_response_cache,
+            "delete",
+            MethodType(silently_fail_cache_delete, rag.llm_response_cache),
+        )
+        first_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert first_result.status == "fail"
+        assert "still exist after delete" in first_result.message
+        assert await rag.doc_status.get_by_id(doc_id) is not None
+        assert await rag.full_docs.get_by_id(doc_id) is not None
+        assert await rag.llm_response_cache.get_by_id(cache_ids[0]) is not None
+
+        monkeypatch.undo()
+        second_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.llm_response_cache.get_by_id(cache_ids[0]) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_retry_preserves_cache_cleanup_state_when_cache_storage_unavailable(
+    tmp_path,
+):
+    rag = await _build_rag(
+        tmp_path, "delete_retry_cache_storage_unavailable", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-cache-storage-unavailable"
+        drop_chunk_id = "chunk-drop"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[drop_chunk_id],
+            chunk_owners={drop_chunk_id: doc_id},
+        )
+        cache_ids = await _seed_chunk_cache_entries(
+            rag, [drop_chunk_id], "cache-storage-unavailable"
+        )
+
+        status_doc = await rag.doc_status.get_by_id(doc_id)
+        assert status_doc is not None
+        status_doc["metadata"] = {"deletion_llm_cache_ids": cache_ids}
+        await rag.doc_status.upsert({doc_id: status_doc})
+
+        cache_storage = rag.llm_response_cache
+        rag.llm_response_cache = None
+
+        first_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert first_result.status == "fail"
+        assert "cache storage is unavailable" in first_result.message
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+        assert failed_status is not None
+        assert failed_status["metadata"]["deletion_llm_cache_ids"] == cache_ids
+        assert await rag.full_docs.get_by_id(doc_id) is not None
+
+        rag.llm_response_cache = cache_storage
+        second_result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.llm_response_cache.get_by_id(cache_ids[0]) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_refuses_when_chunks_list_missing_but_anchors_name_kg(tmp_path):
+    """A chunk-less document whose anchors still name KG objects must be refused.
+
+    Regression for issue #3400. This path used to delete doc_status + full_docs
+    and report success without looking at the graph at all, so the entities and
+    relations the anchors named survived — and removing doc_status destroyed the
+    provenance chain (graph source_id -> text_chunks -> full_doc_id) that was
+    the only remaining way to attribute them. The integrity audit could then
+    only report them as unrecoverable orphans.
+
+    With no chunk ids there is also nothing to subtract from those objects'
+    source lists, so purge cannot classify them: every one would be kept while
+    the anchors were dropped anyway. Hence the dedicated refusal reason rather
+    than a best-effort attempt.
+    """
+    rag = await _build_rag(
+        tmp_path, "delete_missing_chunks_list_rejected", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-missing-chunks-list"
+        drop_chunk_id = "chunk-drop-only"
+        seeded = await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[],
+            tracking_chunk_ids=[drop_chunk_id],
+            chunk_owners={drop_chunk_id: doc_id},
+        )
+        entity_a = seeded["entity_a"]
+        entity_b = seeded["entity_b"]
+        relation_key = seeded["relation_key"]
+
+        result = await rag.adelete_by_doc_id(doc_id)
+
+        assert result.status == "fail"
+        assert result.status_code == 409
+        assert "no chunks to attribute them to" in result.message
+        assert "audit_kg_integrity" in result.message
+        # Nothing was deleted: the document is exactly as it was, so an
+        # operator can repair the anchors and retry.
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+        assert failed_status is not None
+        assert (
+            failed_status["metadata"]["deletion_failure_stage"]
+            == "validate_recovery_anchors"
+        )
+        assert await rag.full_docs.get_by_id(doc_id) is not None
+        assert await rag.full_entities.get_by_id(doc_id) is not None
+        assert await rag.full_relations.get_by_id(doc_id) is not None
+        assert await rag.text_chunks.get_by_id(drop_chunk_id) is not None
+        assert await rag.chunks_vdb.get_by_id(drop_chunk_id) is not None
+        assert await rag.chunk_entity_relation_graph.get_node(entity_a) is not None
+        assert await rag.chunk_entity_relation_graph.get_node(entity_b) is not None
+        assert (
+            await rag.chunk_entity_relation_graph.get_edge(entity_a, entity_b)
+            is not None
+        )
+        assert await rag.entity_chunks.get_by_id(entity_a) is not None
+        assert await rag.entity_chunks.get_by_id(entity_b) is not None
+        assert await rag.relation_chunks.get_by_id(relation_key) is not None
+        assert (
+            await rag.entities_vdb.get_by_id(compute_mdhash_id(entity_a, prefix="ent-"))
+            is not None
+        )
+        assert (
+            await rag.entities_vdb.get_by_id(compute_mdhash_id(entity_b, prefix="ent-"))
+            is not None
+        )
+        assert (
+            await rag.relationships_vdb.get_by_id(
+                compute_mdhash_id(entity_a + entity_b, prefix="rel-")
+            )
+            is not None
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_ignores_stale_graph_source_ids_when_tracking_exists(tmp_path):
+    rag = await _build_rag(
+        tmp_path, "delete_ignore_stale_graph_sources", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-stale-graph-sources"
+        drop_chunk_id = "chunk-drop"
+        stale_chunk_id = "chunk-stale"
+        seeded = await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[drop_chunk_id],
+            chunk_owners={drop_chunk_id: doc_id},
+        )
+        entity_a = seeded["entity_a"]
+        entity_b = seeded["entity_b"]
+        relation_key = seeded["relation_key"]
+        stale_source_id = GRAPH_FIELD_SEP.join([stale_chunk_id, drop_chunk_id])
+
+        await rag.chunk_entity_relation_graph.upsert_node(
+            entity_a,
+            {
+                "entity_id": entity_a,
+                "source_id": stale_source_id,
+                "description": f"{entity_a} description",
+                "entity_type": "test",
+                "file_path": "delete_retry.txt",
+                "created_at": 1,
+                "truncate": "",
+            },
+        )
+        await rag.chunk_entity_relation_graph.upsert_node(
+            entity_b,
+            {
+                "entity_id": entity_b,
+                "source_id": stale_source_id,
+                "description": f"{entity_b} description",
+                "entity_type": "test",
+                "file_path": "delete_retry.txt",
+                "created_at": 1,
+                "truncate": "",
+            },
+        )
+        await rag.chunk_entity_relation_graph.upsert_edge(
+            entity_a,
+            entity_b,
+            {
+                "source": entity_a,
+                "target": entity_b,
+                "source_id": stale_source_id,
+                "description": "related",
+                "keywords": "test",
+                "weight": 1.0,
+                "file_path": "delete_retry.txt",
+            },
+        )
+
+        result = await rag.adelete_by_doc_id(doc_id)
+
+        assert result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.text_chunks.get_by_id(drop_chunk_id) is None
+        assert await rag.chunk_entity_relation_graph.get_node(entity_a) is None
+        assert await rag.chunk_entity_relation_graph.get_node(entity_b) is None
+        assert (
+            await rag.chunk_entity_relation_graph.get_edge(entity_a, entity_b) is None
+        )
+        assert await rag.entity_chunks.get_by_id(entity_a) is None
+        assert await rag.entity_chunks.get_by_id(entity_b) is None
+        assert await rag.relation_chunks.get_by_id(relation_key) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_validate_and_fix_consistency_preserves_chunks_on_reset(tmp_path):
+    rag = await _build_rag(tmp_path, "reset_preserve_chunks", _deterministic_chunking)
+    try:
+        failed_doc_id = "doc-failed-reset"
+        processing_doc_id = "doc-processing-reset"
+        inferred_count_doc_id = "doc-inferred-count-reset"
+
+        now = datetime.now(timezone.utc).isoformat()
+        await rag.full_docs.upsert(
+            {
+                failed_doc_id: {"content": "failed doc", "file_path": "failed.txt"},
+                processing_doc_id: {
+                    "content": "processing doc",
+                    "file_path": "processing.txt",
+                },
+                inferred_count_doc_id: {
+                    "content": "inferred count doc",
+                    "file_path": "inferred.txt",
+                },
+            }
+        )
+        await rag.doc_status.upsert(
+            {
+                failed_doc_id: {
+                    "status": DocStatus.FAILED,
+                    "content_summary": "failed",
+                    "content_length": 10,
+                    "chunks_count": 2,
+                    "chunks_list": ["f-1", "f-2"],
+                    "created_at": now,
+                    "updated_at": now,
+                    "file_path": "failed.txt",
+                    "track_id": "track-1",
+                    "error_msg": "old error",
+                    "metadata": {"old": True},
+                },
+                processing_doc_id: {
+                    "status": DocStatus.PROCESSING,
+                    "content_summary": "processing",
+                    "content_length": 12,
+                    "chunks_count": 1,
+                    "chunks_list": ["p-1"],
+                    "created_at": now,
+                    "updated_at": now,
+                    "file_path": "processing.txt",
+                    "track_id": "track-2",
+                    "error_msg": "old error",
+                    "metadata": {"old": True},
+                },
+                inferred_count_doc_id: {
+                    "status": DocStatus.FAILED,
+                    "content_summary": "inferred",
+                    "content_length": 14,
+                    "chunks_list": ["i-1", "i-2", "i-3"],
+                    "created_at": now,
+                    "updated_at": now,
+                    "file_path": "inferred.txt",
+                    "track_id": "track-3",
+                    "error_msg": "old error",
+                    "metadata": {"old": True},
+                },
+            }
+        )
+
+        failed_docs = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
+        processing_docs = await rag.doc_status.get_docs_by_status(DocStatus.PROCESSING)
+        to_process_docs = {**failed_docs, **processing_docs}
+
+        pipeline_status = {"latest_message": "", "history_messages": []}
+        await rag._validate_and_fix_document_consistency(
+            to_process_docs=to_process_docs,
+            pipeline_status=pipeline_status,
+            pipeline_status_lock=asyncio.Lock(),
+        )
+
+        failed_reset = await rag.doc_status.get_by_id(failed_doc_id)
+        assert failed_reset is not None
+        assert _status_to_text(failed_reset["status"]) == "pending"
+        assert failed_reset.get("chunks_list") == ["f-1", "f-2"]
+        assert failed_reset.get("chunks_count") == 2
+
+        processing_reset = await rag.doc_status.get_by_id(processing_doc_id)
+        assert processing_reset is not None
+        assert _status_to_text(processing_reset["status"]) == "pending"
+        assert processing_reset.get("chunks_list") == ["p-1"]
+        assert processing_reset.get("chunks_count") == 1
+
+        inferred_count_reset = await rag.doc_status.get_by_id(inferred_count_doc_id)
+        assert inferred_count_reset is not None
+        assert _status_to_text(inferred_count_reset["status"]) == "pending"
+        assert inferred_count_reset.get("chunks_list") == ["i-1", "i-2", "i-3"]
+        assert inferred_count_reset.get("chunks_count") == 3
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_validate_and_fix_consistency_repairs_unknown_file_path_from_full_docs(
+    tmp_path,
+):
+    rag = await _build_rag(tmp_path, "repair_reset_file_path", _deterministic_chunking)
+    try:
+        doc_id = "doc-repair-reset"
+        now = datetime.now(timezone.utc).isoformat()
+        await rag.full_docs.upsert(
+            {
+                doc_id: {
+                    "content": "repair path doc",
+                    "file_path": "repaired-from-full-docs.md",
+                }
+            }
+        )
+        await rag.doc_status.upsert(
+            {
+                doc_id: {
+                    "status": DocStatus.FAILED,
+                    "content_summary": "repair path",
+                    "content_length": 15,
+                    "chunks_count": 0,
+                    "chunks_list": [],
+                    "created_at": now,
+                    "updated_at": now,
+                    "file_path": "unknown_source",
+                    "track_id": "track-repair",
+                    "error_msg": "old error",
+                    "metadata": {"old": True},
+                }
+            }
+        )
+
+        failed_docs = await rag.doc_status.get_docs_by_status(DocStatus.FAILED)
+        pipeline_status = {"latest_message": "", "history_messages": []}
+        await rag._validate_and_fix_document_consistency(
+            to_process_docs=failed_docs,
+            pipeline_status=pipeline_status,
+            pipeline_status_lock=asyncio.Lock(),
+        )
+
+        repaired_status = await rag.doc_status.get_by_id(doc_id)
+        assert repaired_status is not None
+        assert _status_to_text(repaired_status["status"]) == "pending"
+        assert repaired_status["file_path"] == "repaired-from-full-docs.md"
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cancellation_preserves_file_path_for_queued_docs(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path,
+        "cancel_preserve_file_path",
+        _deterministic_chunking,
+        max_parallel_insert=1,
+    )
+    try:
+        contents = ["first queued content", "second queued content"]
+        file_paths = ["first.md", "second.md"]
+        await rag.apipeline_enqueue_documents(input=contents, file_paths=file_paths)
+
+        extraction_started = asyncio.Event()
+        release_first_doc = asyncio.Event()
+
+        async def _blocking_extract(
+            self, chunks, pipeline_status, pipeline_status_lock, **kwargs
+        ):
+            extraction_started.set()
+            await release_first_doc.wait()
+            return []
+
+        monkeypatch.setattr(
+            rag,
+            "_process_extract_entities",
+            MethodType(_blocking_extract, rag),
+        )
+
+        pipeline_task = asyncio.create_task(rag.apipeline_process_enqueue_documents())
+        await asyncio.wait_for(extraction_started.wait(), timeout=5)
+
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=rag.workspace
+        )
+        pipeline_status_lock = get_namespace_lock(
+            "pipeline_status", workspace=rag.workspace
+        )
+        async with pipeline_status_lock:
+            pipeline_status["cancellation_requested"] = True
+
+        release_first_doc.set()
+        await asyncio.wait_for(pipeline_task, timeout=5)
+
+        second_doc_id = compute_mdhash_id(file_paths[1], prefix="doc-")
+        second_status = await rag.doc_status.get_by_id(second_doc_id)
+        assert second_status is not None
+        assert _status_to_text(second_status["status"]) == "failed"
+        assert second_status["file_path"] == "second.md"
+        assert second_status["error_msg"] == "User cancelled"
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cancellation_repairs_placeholder_file_path_for_queued_docs(
+    tmp_path, monkeypatch
+):
+    rag = await _build_rag(
+        tmp_path,
+        "cancel_repair_placeholder_file_path",
+        _deterministic_chunking,
+        max_parallel_insert=1,
+    )
+    try:
+        contents = ["first queued content", "second queued content"]
+        file_paths = ["first.md", "second.md"]
+        await rag.apipeline_enqueue_documents(input=contents, file_paths=file_paths)
+
+        second_doc_id = compute_mdhash_id(file_paths[1], prefix="doc-")
+        second_status = await rag.doc_status.get_by_id(second_doc_id)
+        assert second_status is not None
+        second_status["file_path"] = "unknown_source"
+        await rag.doc_status.upsert({second_doc_id: second_status})
+
+        extraction_started = asyncio.Event()
+        release_first_doc = asyncio.Event()
+
+        async def _blocking_extract(
+            self, chunks, pipeline_status, pipeline_status_lock, **kwargs
+        ):
+            extraction_started.set()
+            await release_first_doc.wait()
+            return []
+
+        monkeypatch.setattr(
+            rag,
+            "_process_extract_entities",
+            MethodType(_blocking_extract, rag),
+        )
+
+        pipeline_task = asyncio.create_task(rag.apipeline_process_enqueue_documents())
+        await asyncio.wait_for(extraction_started.wait(), timeout=5)
+
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=rag.workspace
+        )
+        pipeline_status_lock = get_namespace_lock(
+            "pipeline_status", workspace=rag.workspace
+        )
+        async with pipeline_status_lock:
+            pipeline_status["cancellation_requested"] = True
+
+        release_first_doc.set()
+        await asyncio.wait_for(pipeline_task, timeout=5)
+
+        repaired_status = await rag.doc_status.get_by_id(second_doc_id)
+        assert repaired_status is not None
+        assert _status_to_text(repaired_status["status"]) == "failed"
+        assert repaired_status["file_path"] == "second.md"
+        assert repaired_status["error_msg"] == "User cancelled"
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_doc_entries_guard_prevents_zombie_record(tmp_path, monkeypatch):
+    """When doc_status.delete fails, the guard must not re-create a zombie record.
+
+    The exception handler skips _update_delete_retry_state when deletion_stage is
+    "delete_doc_entries". doc_status.delete runs first, so full_docs is still intact
+    on failure. This test confirms: (a) the result is status="fail", and (b) the
+    exception handler does not upsert a new record with deletion_failed=True.
+    """
+    rag = await _build_rag(
+        tmp_path, "delete_doc_entries_guard", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-delete-entries-guard"
+        drop_chunk_id = "chunk-drop"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[drop_chunk_id],
+            chunk_owners={drop_chunk_id: doc_id},
+        )
+
+        original_delete = rag.doc_status.delete
+
+        call_count = 0
+
+        async def fail_doc_status_delete(ids):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("doc_status delete fail sentinel")
+
+        monkeypatch.setattr(rag.doc_status, "delete", fail_doc_status_delete)
+
+        result = await rag.adelete_by_doc_id(doc_id)
+
+        monkeypatch.setattr(rag.doc_status, "delete", original_delete)
+
+        assert result.status == "fail"
+        assert "doc_status delete fail sentinel" in result.message
+        # doc_status.delete is now called first (before full_docs.delete). The patch
+        # makes it fail, so doc_status still exists. The guard must not call
+        # _update_delete_retry_state (which would upsert the record with
+        # deletion_failed=True) when deletion_stage is "delete_doc_entries".
+        status_record = await rag.doc_status.get_by_id(doc_id)
+        assert status_record is not None, (
+            "doc_status should still exist (delete failed)"
+        )
+        metadata = status_record.get("metadata", {})
+        assert not metadata.get("deletion_failed"), (
+            "guard failed: zombie record written with deletion_failed=True"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_retry_state_write_failure_in_exception_handler_still_returns_fail(
+    tmp_path, monkeypatch
+):
+    """If _update_delete_retry_state itself fails inside the exception handler,
+    the caller must still receive a well-formed DeletionResult with status="fail"
+    and the original error message — not an unhandled exception.
+    """
+    rag = await _build_rag(
+        tmp_path, "retry_state_write_failure", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-retry-state-write-fail"
+        keep_chunk_id = "chunk-keep"
+        drop_chunk_id = "chunk-drop"
+        # Include a keep_chunk_id so entities survive and rebuild is triggered
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[keep_chunk_id, drop_chunk_id],
+            chunk_owners={
+                keep_chunk_id: "doc-keep",
+                drop_chunk_id: doc_id,
+            },
+        )
+
+        async def fail_rebuild(**kwargs):
+            raise RuntimeError("rebuild fail sentinel")
+
+        async def fail_upsert(data):
+            raise RuntimeError("doc_status upsert fail sentinel")
+
+        monkeypatch.setattr(
+            lightrag_module, "rebuild_knowledge_from_chunks", fail_rebuild
+        )
+        monkeypatch.setattr(rag.doc_status, "upsert", fail_upsert)
+
+        result = await rag.adelete_by_doc_id(doc_id)
+
+        assert result.status == "fail"
+        # The original rebuild error must be present in the message; the compound
+        # "Additionally, failed to persist retry state" suffix may also be present.
+        assert "rebuild fail sentinel" in result.message
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_persist_pre_rebuild_failure_records_stage_and_allows_retry(
+    tmp_path, monkeypatch
+):
+    """A failure in _insert_done (persist_pre_rebuild_changes stage) records the
+    correct stage in doc_status metadata, and a subsequent retry completes the
+    deletion successfully.
+    """
+    rag = await _build_rag(
+        tmp_path, "persist_pre_rebuild_failure", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-persist-pre-rebuild-failure"
+        keep_chunk_id = "chunk-keep"
+        drop_chunk_id = "chunk-drop"
+        seeded = await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[keep_chunk_id, drop_chunk_id],
+            chunk_owners={
+                keep_chunk_id: "doc-keep",
+                drop_chunk_id: doc_id,
+            },
+        )
+        entity_a = seeded["entity_a"]
+        # entity_b = seeded["entity_b"]
+
+        insert_done_calls = 0
+        original_insert_done = rag._insert_done
+
+        async def fail_first_insert_done():
+            nonlocal insert_done_calls
+            insert_done_calls += 1
+            if insert_done_calls == 1:
+                raise RuntimeError("insert_done fail sentinel")
+            await original_insert_done()
+
+        monkeypatch.setattr(rag, "_insert_done", fail_first_insert_done)
+
+        first_result = await rag.adelete_by_doc_id(doc_id)
+
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+        assert first_result.status == "fail"
+        assert "insert_done fail sentinel" in first_result.message
+        assert failed_status is not None
+        assert failed_status["metadata"]["deletion_failed"] is True
+        assert (
+            failed_status["metadata"]["deletion_failure_stage"]
+            == "persist_pre_rebuild_changes"
+        )
+
+        monkeypatch.undo()
+        monkeypatch.setattr(
+            lightrag_module,
+            "rebuild_knowledge_from_chunks",
+            _succeed_rebuild_from_remaining_chunks,
+        )
+        second_result = await rag.adelete_by_doc_id(doc_id)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.text_chunks.get_by_id(drop_chunk_id) is None
+        assert await rag.text_chunks.get_by_id(keep_chunk_id) is not None
+        entity_a_tracking = await rag.entity_chunks.get_by_id(entity_a)
+        assert entity_a_tracking is not None
+        assert entity_a_tracking["chunk_ids"] == [keep_chunk_id]
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_delete_doc_graph_metadata_failure_records_stage_and_allows_retry(
+    tmp_path, monkeypatch
+):
+    """A failure in full_relations.delete (delete_doc_graph_metadata stage) records
+    the correct stage in retry metadata, and a subsequent retry completes the deletion.
+    """
+    rag = await _build_rag(
+        tmp_path, "delete_doc_graph_metadata_failure", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-graph-metadata-failure"
+        drop_chunk_id = "chunk-drop"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[drop_chunk_id],
+            chunk_owners={drop_chunk_id: doc_id},
+        )
+
+        relations_delete_calls = 0
+        original_relations_delete = rag.full_relations.delete
+
+        async def fail_first_relations_delete(ids):
+            nonlocal relations_delete_calls
+            relations_delete_calls += 1
+            if relations_delete_calls == 1:
+                raise RuntimeError("full_relations delete fail sentinel")
+            await original_relations_delete(ids)
+
+        monkeypatch.setattr(rag.full_relations, "delete", fail_first_relations_delete)
+
+        first_result = await rag.adelete_by_doc_id(doc_id)
+
+        failed_status = await rag.doc_status.get_by_id(doc_id)
+        assert first_result.status == "fail"
+        assert "full_relations delete fail sentinel" in first_result.message
+        assert failed_status is not None
+        assert failed_status["metadata"]["deletion_failed"] is True
+        assert (
+            failed_status["metadata"]["deletion_failure_stage"]
+            == "delete_doc_graph_metadata"
+        )
+
+        monkeypatch.undo()
+        second_result = await rag.adelete_by_doc_id(doc_id)
+
+        assert second_result.status == "success"
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.full_entities.get_by_id(doc_id) is None
+        assert await rag.full_relations.get_by_id(doc_id) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_deletion_fully_completed_prevents_success_override_in_finally(
+    tmp_path, monkeypatch
+):
+    """When deletion completes successfully but _insert_done fails in the finally
+    block, the already-returned success result must not be overridden with a failure.
+    This covers both the no-chunk path and the full deletion path.
+    """
+    for scenario in ("no_chunk", "full"):
+        rag = await _build_rag(
+            tmp_path,
+            f"deletion_fully_completed_{scenario}",
+            _deterministic_chunking,
+        )
+        try:
+            doc_id = f"doc-fully-completed-{scenario}"
+
+            if scenario == "no_chunk":
+                # Seed a doc with no chunks: doc_status.chunks_list is empty.
+                now = datetime.now(timezone.utc).isoformat()
+                await rag.full_docs.upsert(
+                    {doc_id: {"content": "no chunk doc", "file_path": "nc.txt"}}
+                )
+                await rag.doc_status.upsert(
+                    {
+                        doc_id: {
+                            "status": DocStatus.PROCESSED,
+                            "content_summary": "no chunks",
+                            "content_length": 11,
+                            "chunks_count": 0,
+                            "chunks_list": [],
+                            "created_at": now,
+                            "updated_at": now,
+                            "file_path": "nc.txt",
+                            "track_id": f"track-{doc_id}",
+                            "error_msg": "",
+                            "metadata": {},
+                        }
+                    }
+                )
+                # A real PROCESSED document always has both anchor rows, even
+                # with zero chunks: merge writes them in Phase 0 before any
+                # mutation. Present-and-empty is a valid recovery proof — the
+                # distinction fail-closed purge turns on.
+                await rag.full_entities.upsert({doc_id: {"entity_names": []}})
+                await rag.full_relations.upsert({doc_id: {"relation_pairs": []}})
+            else:
+                drop_chunk_id = "chunk-drop-fc"
+                await _seed_delete_retry_state(
+                    rag,
+                    doc_id=doc_id,
+                    status_chunk_ids=[drop_chunk_id],
+                    tracking_chunk_ids=[drop_chunk_id],
+                    chunk_owners={drop_chunk_id: doc_id},
+                )
+
+            insert_done_calls = 0
+            original_insert_done = rag._insert_done
+
+            async def fail_later_insert_done():
+                nonlocal insert_done_calls
+                insert_done_calls += 1
+                # Let the purge's own persist_pre_rebuild_changes flush succeed
+                # in BOTH scenarios and fail only the finally-block call. The
+                # no-chunk path now runs the same purge primitive as the
+                # chunk-backed one (it has to, in order to fail closed when the
+                # document's KG contributions are unaccounted for), so it makes
+                # that flush too.
+                if insert_done_calls <= 1:
+                    await original_insert_done()
+                else:
+                    raise RuntimeError("finally insert_done fail sentinel")
+
+            monkeypatch.setattr(rag, "_insert_done", fail_later_insert_done)
+
+            result = await rag.adelete_by_doc_id(doc_id)
+
+            assert result.status == "success", (
+                f"[{scenario}] expected success but got {result.status}: {result.message}"
+            )
+        finally:
+            monkeypatch.undo()
+            await rag.finalize_storages()
+
+
+async def _seed_no_chunk_smartheading_doc(
+    rag: LightRAG, doc_id: str, cache_ids: list[str]
+) -> None:
+    """Seed a chunk-less doc whose doc_status.metadata records parse-stage
+    smart_heading LLM cache keys, plus the matching cache entries.
+
+    Mirrors the real FAILED state a docx leaves when parse succeeds (writing
+    smart_heading cache) but a later pipeline stage fails before any chunk is
+    produced — the cache keys then live only in doc_status.metadata.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    await rag.full_docs.upsert(
+        {doc_id: {"content": "smart heading doc", "file_path": "sh.docx"}}
+    )
+    await rag.doc_status.upsert(
+        {
+            doc_id: {
+                "status": DocStatus.FAILED,
+                "content_summary": "smart heading",
+                "content_length": 17,
+                "chunks_count": 0,
+                "chunks_list": [],
+                "created_at": now,
+                "updated_at": now,
+                "file_path": "sh.docx",
+                "track_id": f"track-{doc_id}",
+                "error_msg": "parse-stage failure",
+                # No recovery anchors, because the run never reached merge —
+                # the enqueue-time kg_write_state marker is what proves that
+                # and lets deletion clean the row up instead of failing closed.
+                "metadata": {
+                    "smartheading_llm_cache_ids": cache_ids,
+                    KG_WRITE_STATE_METADATA_KEY: KG_WRITE_STATE_PRE_GRAPH,
+                },
+            }
+        }
+    )
+    await rag.llm_response_cache.upsert(
+        {
+            cid: {"cache_type": "smartheading", "return": f"cached-{cid}"}
+            for cid in cache_ids
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_smartheading_metadata_cache_deleted_on_delete_with_no_chunks(tmp_path):
+    """delete_llm_cache=True purges smart_heading cache keys that ride only in
+    doc_status.metadata (no chunk llm_cache_list to carry them).
+
+    Locks the no-chunk deletion branch: the metadata merge in
+    ``adelete_by_doc_id`` (smartheading_llm_cache_ids -> deletion pool) followed
+    by the delete + verify on the chunk-less path.
+    """
+    rag = await _build_rag(
+        tmp_path, "smartheading_no_chunk_cache", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-smartheading-no-chunk"
+        cache_ids = ["default:smartheading:h1", "default:smartheading:h2"]
+        await _seed_no_chunk_smartheading_doc(rag, doc_id, cache_ids)
+
+        result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert result.status == "success"
+        remaining = [await rag.llm_response_cache.get_by_id(cid) for cid in cache_ids]
+        assert all(item is None for item in remaining)
+        assert await rag.doc_status.get_by_id(doc_id) is None
+        assert await rag.full_docs.get_by_id(doc_id) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_smartheading_metadata_cache_preserved_when_delete_llm_cache_disabled(
+    tmp_path,
+):
+    """delete_llm_cache=False deletes the doc but must leave the smart_heading
+    cache entries intact — proving the flag gates the metadata merge/delete
+    rather than the cache being wiped unconditionally.
+    """
+    rag = await _build_rag(
+        tmp_path, "smartheading_no_chunk_cache_kept", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-smartheading-keep-cache"
+        cache_ids = ["default:smartheading:k1", "default:smartheading:k2"]
+        await _seed_no_chunk_smartheading_doc(rag, doc_id, cache_ids)
+
+        result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=False)
+
+        assert result.status == "success"
+        remaining = [await rag.llm_response_cache.get_by_id(cid) for cid in cache_ids]
+        assert all(item is not None for item in remaining)
+        assert await rag.doc_status.get_by_id(doc_id) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_smartheading_metadata_cache_deleted_alongside_chunk_cache(
+    tmp_path, monkeypatch
+):
+    """For a chunk-backed doc, delete_llm_cache=True must purge BOTH the
+    parse-stage smart_heading cache (from doc_status.metadata) and the chunk
+    llm_cache_list entries in one deletion.
+
+    Locks the chunk-backed consumption of the metadata merge: the deletion pool
+    is seeded from metadata_cache_ids before chunk llm_cache_list is appended.
+    """
+    rag = await _build_rag(
+        tmp_path, "smartheading_with_chunk_cache", _deterministic_chunking
+    )
+    try:
+        doc_id = "doc-smartheading-chunk-cache"
+        keep_chunk_id = "chunk-keep"
+        drop_chunk_id = "chunk-drop"
+        smartheading_cache_id = "default:smartheading:h3"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=[drop_chunk_id],
+            tracking_chunk_ids=[keep_chunk_id, drop_chunk_id],
+            chunk_owners={keep_chunk_id: "doc-keep", drop_chunk_id: doc_id},
+            metadata={"smartheading_llm_cache_ids": [smartheading_cache_id]},
+        )
+        chunk_cache_ids = await _seed_chunk_cache_entries(
+            rag, [drop_chunk_id], "smartheading-chunk"
+        )
+        await rag.llm_response_cache.upsert(
+            {
+                smartheading_cache_id: {
+                    "cache_type": "smartheading",
+                    "return": "cached-heading",
+                }
+            }
+        )
+
+        monkeypatch.setattr(
+            lightrag_module,
+            "rebuild_knowledge_from_chunks",
+            _succeed_rebuild_from_remaining_chunks,
+        )
+        result = await rag.adelete_by_doc_id(doc_id, delete_llm_cache=True)
+
+        assert result.status == "success"
+        assert await rag.llm_response_cache.get_by_id(smartheading_cache_id) is None
+        assert await rag.llm_response_cache.get_by_id(chunk_cache_ids[0]) is None
+        assert await rag.doc_status.get_by_id(doc_id) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_smartheading_cache_cleared_by_aclear_cache(tmp_path):
+    """The 'clear documents + clear cache' UI flow calls aclear_cache() ->
+    drop(), which wipes the whole llm_response_cache regardless of cache_type,
+    so smart_heading entries are cleared too.
+    """
+    rag = await _build_rag(
+        tmp_path, "smartheading_aclear_cache", _deterministic_chunking
+    )
+    try:
+        cache_id = "default:smartheading:hx"
+        await rag.llm_response_cache.upsert(
+            {cache_id: {"cache_type": "smartheading", "return": "cached-heading"}}
+        )
+        assert await rag.llm_response_cache.get_by_id(cache_id) is not None
+
+        await rag.aclear_cache()
+
+        assert await rag.llm_response_cache.get_by_id(cache_id) is None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_edit_does_not_reseed_present_but_empty_chunk_tracking(tmp_path):
+    """Regression for #3609.
+
+    A persisted chunk-tracking row of ``{"chunk_ids": [], "count": 0}`` is
+    authoritative ("this entity tracks no chunks") and must be distinguished from an
+    absent row. Editing the entity must not repopulate the empty row from the graph
+    node's ``source_id``, which may still name chunks a previous purge pruned.
+    """
+    rag = await _build_rag(tmp_path, "reseed_guard", _deterministic_chunking)
+    try:
+        entity_name = "StaleEntity"
+        stale_source_id = "chunk-already-purged"
+        created_at = int(datetime.now(timezone.utc).timestamp())
+
+        # Graph node still names a chunk that a previous purge already removed.
+        await rag.chunk_entity_relation_graph.upsert_node(
+            entity_name,
+            {
+                "entity_id": entity_name,
+                "source_id": stale_source_id,
+                "description": f"{entity_name} description",
+                "entity_type": "test",
+                "file_path": "reseed.txt",
+                "created_at": created_at,
+            },
+        )
+        await rag.entities_vdb.upsert(
+            {
+                compute_mdhash_id(entity_name, prefix="ent-"): {
+                    "content": f"{entity_name}\n{entity_name} description",
+                    "entity_name": entity_name,
+                    "source_id": stale_source_id,
+                    "description": f"{entity_name} description",
+                    "entity_type": "test",
+                    "file_path": "reseed.txt",
+                }
+            }
+        )
+        # Authoritative, curated tracking row: this entity tracks no chunks.
+        await rag.entity_chunks.upsert({entity_name: {"chunk_ids": [], "count": 0}})
+
+        # Edit only the description; the source_id is unchanged.
+        await rag.aedit_entity(entity_name, {"description": "updated description"})
+
+        # The empty row must stay empty, not be reseeded from the stale source_id.
+        row = await rag.entity_chunks.get_by_id(entity_name)
+        assert row is not None, "tracking row should still exist"
+        assert row.get("chunk_ids") == [], (
+            f"present-but-empty tracking row was reseeded from stale source_id: {row}"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_edit_seeds_chunk_tracking_from_source_id_when_row_absent(tmp_path):
+    """Regression pin for #3609 (the direction the presence guard was narrowed).
+
+    When no chunk-tracking row exists at all (``get_by_id`` returns ``None``),
+    editing the entity must fall back to seeding the tracking row from the graph
+    node's ``source_id``. This pins the migration fallback so the narrowed
+    presence check keeps seeding never-migrated objects.
+    """
+    rag = await _build_rag(tmp_path, "absent_seed", _deterministic_chunking)
+    try:
+        entity_name = "FreshEntity"
+        source_chunk = "chunk-live-1"
+        created_at = int(datetime.now(timezone.utc).timestamp())
+
+        await rag.chunk_entity_relation_graph.upsert_node(
+            entity_name,
+            {
+                "entity_id": entity_name,
+                "source_id": source_chunk,
+                "description": f"{entity_name} description",
+                "entity_type": "test",
+                "file_path": "absent.txt",
+                "created_at": created_at,
+            },
+        )
+        await rag.entities_vdb.upsert(
+            {
+                compute_mdhash_id(entity_name, prefix="ent-"): {
+                    "content": f"{entity_name}\n{entity_name} description",
+                    "entity_name": entity_name,
+                    "source_id": source_chunk,
+                    "description": f"{entity_name} description",
+                    "entity_type": "test",
+                    "file_path": "absent.txt",
+                }
+            }
+        )
+        # No tracking row seeded: it is genuinely absent.
+        assert await rag.entity_chunks.get_by_id(entity_name) is None
+
+        await rag.aedit_entity(entity_name, {"description": "updated description"})
+
+        row = await rag.entity_chunks.get_by_id(entity_name)
+        assert row is not None, "absent tracking row should be seeded on edit"
+        assert row.get("chunk_ids") == [source_chunk], (
+            f"absent row must be seeded from source_id, got: {row}"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_edit_treats_row_without_chunk_ids_key_as_absent(tmp_path):
+    """Regression for #3609: a row of ``{}`` (present but with no ``chunk_ids``
+    key) is 'unknown', not an authoritative empty tracking row, and must be
+    seeded from the graph node's ``source_id`` like an absent row.
+    """
+    rag = await _build_rag(tmp_path, "empty_dict_seed", _deterministic_chunking)
+    try:
+        entity_name = "UnknownEntity"
+        source_chunk = "chunk-live-2"
+        created_at = int(datetime.now(timezone.utc).timestamp())
+
+        await rag.chunk_entity_relation_graph.upsert_node(
+            entity_name,
+            {
+                "entity_id": entity_name,
+                "source_id": source_chunk,
+                "description": f"{entity_name} description",
+                "entity_type": "test",
+                "file_path": "unknown.txt",
+                "created_at": created_at,
+            },
+        )
+        await rag.entities_vdb.upsert(
+            {
+                compute_mdhash_id(entity_name, prefix="ent-"): {
+                    "content": f"{entity_name}\n{entity_name} description",
+                    "entity_name": entity_name,
+                    "source_id": source_chunk,
+                    "description": f"{entity_name} description",
+                    "entity_type": "test",
+                    "file_path": "unknown.txt",
+                }
+            }
+        )
+        # Present row but with no chunk_ids key -> unknown, must be reseeded.
+        await rag.entity_chunks.upsert({entity_name: {}})
+
+        await rag.aedit_entity(entity_name, {"description": "updated description"})
+
+        row = await rag.entity_chunks.get_by_id(entity_name)
+        assert row is not None
+        assert row.get("chunk_ids") == [source_chunk], (
+            "a row without a chunk_ids key must be treated as absent and seeded "
+            f"from source_id, got: {row}"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_rename_migrates_present_but_empty_relation_tracking_row(tmp_path):
+    """Regression for #3609: renaming an entity migrates a curated EMPTY relation
+    tracking row to the new key instead of dropping it.
+
+    Dropping it would make the row absent, so the next relation edit would reseed
+    it from the edge's (possibly stale) ``source_id`` — re-arming the exact bug
+    this PR fixes, through the HTTP-reachable rename path.
+    """
+    rag = await _build_rag(tmp_path, "rename_empty_relation", _deterministic_chunking)
+    try:
+        entity_a, entity_b, renamed = "EntA", "EntB", "EntZ"
+        stale_chunk = "chunk-stale"
+        created_at = int(datetime.now(timezone.utc).timestamp())
+
+        for name in (entity_a, entity_b):
+            await rag.chunk_entity_relation_graph.upsert_node(
+                name,
+                {
+                    "entity_id": name,
+                    "source_id": stale_chunk,
+                    "description": f"{name} description",
+                    "entity_type": "test",
+                    "file_path": "rename.txt",
+                    "created_at": created_at,
+                },
+            )
+        await rag.chunk_entity_relation_graph.upsert_edge(
+            entity_a,
+            entity_b,
+            {
+                "source": entity_a,
+                "target": entity_b,
+                "source_id": stale_chunk,
+                "description": "related",
+                "keywords": "test",
+                "weight": 1.0,
+                "file_path": "rename.txt",
+            },
+        )
+        await rag.entities_vdb.upsert(
+            {
+                compute_mdhash_id(name, prefix="ent-"): {
+                    "content": f"{name}\n{name} description",
+                    "entity_name": name,
+                    "source_id": stale_chunk,
+                    "description": f"{name} description",
+                    "entity_type": "test",
+                    "file_path": "rename.txt",
+                }
+                for name in (entity_a, entity_b)
+            }
+        )
+        await rag.relationships_vdb.upsert(
+            {
+                compute_mdhash_id(entity_a + entity_b, prefix="rel-"): {
+                    "content": f"test\t{entity_a}\n{entity_b}\nrelated",
+                    "src_id": entity_a,
+                    "tgt_id": entity_b,
+                    "source_id": stale_chunk,
+                    "description": "related",
+                    "keywords": "test",
+                    "weight": 1.0,
+                    "file_path": "rename.txt",
+                }
+            }
+        )
+        # Curated empty relation tracking row: this relation tracks no chunks.
+        old_key = make_relation_chunk_key(entity_a, entity_b)
+        await rag.relation_chunks.upsert({old_key: {"chunk_ids": [], "count": 0}})
+
+        # Rename EntA -> EntZ (the HTTP-reachable path).
+        await rag.aedit_entity(entity_a, {"entity_name": renamed}, allow_rename=True)
+
+        new_key = make_relation_chunk_key(renamed, entity_b)
+        old_row = await rag.relation_chunks.get_by_id(old_key)
+        new_row = await rag.relation_chunks.get_by_id(new_key)
+
+        assert old_row is None, f"old-key relation row should be removed, got {old_row}"
+        assert new_row is not None, "curated empty relation row must survive the rename"
+        assert new_row.get("chunk_ids") == [], (
+            "empty relation row must migrate as empty, not reseed from the stale "
+            f"source_id: {new_row}"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_rename_reseeds_relation_row_without_chunk_ids_key(tmp_path):
+    """A legacy/partial relation row with no ``chunk_ids`` key (e.g. ``{"count": 0}``)
+    is 'unknown', not an authoritative empty row. On rename it must be treated as
+    absent and reseeded from the edge's ``source_id`` — consistent with how the
+    entity/relation edit paths classify the same shape (per the #3660 review).
+    """
+    rag = await _build_rag(tmp_path, "rename_partial_relation", _deterministic_chunking)
+    try:
+        entity_a, entity_b, renamed = "EntA", "EntB", "EntZ"
+        live_chunk = "chunk-live"
+        created_at = int(datetime.now(timezone.utc).timestamp())
+
+        for name in (entity_a, entity_b):
+            await rag.chunk_entity_relation_graph.upsert_node(
+                name,
+                {
+                    "entity_id": name,
+                    "source_id": live_chunk,
+                    "description": f"{name} description",
+                    "entity_type": "test",
+                    "file_path": "rename.txt",
+                    "created_at": created_at,
+                },
+            )
+        await rag.chunk_entity_relation_graph.upsert_edge(
+            entity_a,
+            entity_b,
+            {
+                "source": entity_a,
+                "target": entity_b,
+                "source_id": live_chunk,
+                "description": "related",
+                "keywords": "test",
+                "weight": 1.0,
+                "file_path": "rename.txt",
+            },
+        )
+        await rag.entities_vdb.upsert(
+            {
+                compute_mdhash_id(name, prefix="ent-"): {
+                    "content": f"{name}\n{name} description",
+                    "entity_name": name,
+                    "source_id": live_chunk,
+                    "description": f"{name} description",
+                    "entity_type": "test",
+                    "file_path": "rename.txt",
+                }
+                for name in (entity_a, entity_b)
+            }
+        )
+        await rag.relationships_vdb.upsert(
+            {
+                compute_mdhash_id(entity_a + entity_b, prefix="rel-"): {
+                    "content": f"test\t{entity_a}\n{entity_b}\nrelated",
+                    "src_id": entity_a,
+                    "tgt_id": entity_b,
+                    "source_id": live_chunk,
+                    "description": "related",
+                    "keywords": "test",
+                    "weight": 1.0,
+                    "file_path": "rename.txt",
+                }
+            }
+        )
+        # Legacy/partial row: present dict but no "chunk_ids" key -> unknown.
+        old_key = make_relation_chunk_key(entity_a, entity_b)
+        await rag.relation_chunks.upsert({old_key: {"count": 0}})
+
+        await rag.aedit_entity(entity_a, {"entity_name": renamed}, allow_rename=True)
+
+        new_key = make_relation_chunk_key(renamed, entity_b)
+        new_row = await rag.relation_chunks.get_by_id(new_key)
+
+        assert new_row is not None, "row should be reseeded under the new key"
+        assert new_row.get("chunk_ids") == [live_chunk], (
+            "a row without a chunk_ids key must be treated as absent and reseeded "
+            f"from source_id, not persisted as empty: {new_row}"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_edit_treats_null_chunk_ids_as_absent(tmp_path):
+    """A malformed row of ``{"chunk_ids": None}`` must be treated as absent, not
+    present. Testing only key-presence would classify it as present and then
+    iterate ``None`` -> ``TypeError`` (a 500 after partial mutation). It must be
+    reseeded from the graph node's ``source_id`` instead (per the #3660 review).
+    """
+    rag = await _build_rag(tmp_path, "null_chunk_ids", _deterministic_chunking)
+    try:
+        entity_name = "NullEntity"
+        live_chunk = "chunk-live-null"
+        created_at = int(datetime.now(timezone.utc).timestamp())
+
+        await rag.chunk_entity_relation_graph.upsert_node(
+            entity_name,
+            {
+                "entity_id": entity_name,
+                "source_id": live_chunk,
+                "description": f"{entity_name} description",
+                "entity_type": "test",
+                "file_path": "null.txt",
+                "created_at": created_at,
+            },
+        )
+        await rag.entities_vdb.upsert(
+            {
+                compute_mdhash_id(entity_name, prefix="ent-"): {
+                    "content": f"{entity_name}\n{entity_name} description",
+                    "entity_name": entity_name,
+                    "source_id": live_chunk,
+                    "description": f"{entity_name} description",
+                    "entity_type": "test",
+                    "file_path": "null.txt",
+                }
+            }
+        )
+        # Malformed/legacy row: present dict, but chunk_ids is null (not a list).
+        await rag.entity_chunks.upsert({entity_name: {"chunk_ids": None}})
+
+        # Renaming enters the tracking branch unconditionally. On the old
+        # key-presence check this iterated `None` and raised TypeError; it must
+        # instead treat the row as absent and reseed from source_id.
+        await rag.aedit_entity(
+            entity_name, {"entity_name": "NullEntityZ"}, allow_rename=True
+        )
+
+        row = await rag.entity_chunks.get_by_id("NullEntityZ")
+        assert row is not None
+        assert row.get("chunk_ids") == [live_chunk], (
+            "a null chunk_ids must be treated as absent and reseeded from "
+            f"source_id, got: {row}"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_relation_edit_treats_null_chunk_ids_as_absent(tmp_path):
+    """A malformed relation row with null ``chunk_ids`` must be reseeded.
+
+    Relation edits update the graph and VDB before synchronizing chunk tracking.
+    Treating key presence as a usable row would therefore iterate ``None`` and
+    fail after partial mutation when ``source_id`` changes.
+    """
+    rag = await _build_rag(tmp_path, "relation_null_chunk_ids", _deterministic_chunking)
+    try:
+        source_entity, target_entity = "EntA", "EntB"
+        old_chunk = "chunk-old"
+        new_chunk = "chunk-new"
+
+        await rag.chunk_entity_relation_graph.upsert_edge(
+            source_entity,
+            target_entity,
+            {
+                "source": source_entity,
+                "target": target_entity,
+                "source_id": old_chunk,
+                "description": "related",
+                "keywords": "test",
+                "weight": 1.0,
+            },
+        )
+        storage_key = make_relation_chunk_key(source_entity, target_entity)
+        await rag.relation_chunks.upsert({storage_key: {"chunk_ids": None, "count": 0}})
+
+        await rag.aedit_relation(source_entity, target_entity, {"source_id": new_chunk})
+
+        row = await rag.relation_chunks.get_by_id(storage_key)
+        assert row is not None
+        assert row.get("chunk_ids") == [new_chunk], (
+            "a null chunk_ids must be treated as absent and updated from the "
+            f"edge source_id delta, got: {row}"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_merge_reseeds_relation_row_without_chunk_ids(tmp_path):
+    """`amerge_entities` must classify a partial relation tracking row
+    (e.g. ``{"count": 0}``, no ``chunk_ids`` list) as unknown and reseed it from
+    the edge's live ``source_id`` — not persist an authoritative empty row at the
+    merged key (per the #3660 review, item 2)."""
+    rag = await _build_rag(tmp_path, "merge_partial_relation", _deterministic_chunking)
+    try:
+        src, other, target = "SrcA", "Common", "TargetE"
+        live_chunk = "chunk-live-merge"
+        created_at = int(datetime.now(timezone.utc).timestamp())
+
+        for name in (src, other):
+            await rag.chunk_entity_relation_graph.upsert_node(
+                name,
+                {
+                    "entity_id": name,
+                    "source_id": live_chunk,
+                    "description": f"{name} description",
+                    "entity_type": "test",
+                    "file_path": "merge.txt",
+                    "created_at": created_at,
+                },
+            )
+        await rag.chunk_entity_relation_graph.upsert_edge(
+            src,
+            other,
+            {
+                "source": src,
+                "target": other,
+                "source_id": live_chunk,
+                "description": "related",
+                "keywords": "test",
+                "weight": 1.0,
+                "file_path": "merge.txt",
+            },
+        )
+        await rag.entities_vdb.upsert(
+            {
+                compute_mdhash_id(name, prefix="ent-"): {
+                    "content": f"{name}\n{name} description",
+                    "entity_name": name,
+                    "source_id": live_chunk,
+                    "description": f"{name} description",
+                    "entity_type": "test",
+                    "file_path": "merge.txt",
+                }
+                for name in (src, other)
+            }
+        )
+        await rag.relationships_vdb.upsert(
+            {
+                compute_mdhash_id(src + other, prefix="rel-"): {
+                    "content": f"test\t{src}\n{other}\nrelated",
+                    "src_id": src,
+                    "tgt_id": other,
+                    "source_id": live_chunk,
+                    "description": "related",
+                    "keywords": "test",
+                    "weight": 1.0,
+                    "file_path": "merge.txt",
+                }
+            }
+        )
+        # Partial relation row: present dict, no chunk_ids list.
+        await rag.relation_chunks.upsert(
+            {make_relation_chunk_key(src, other): {"count": 0}}
+        )
+
+        await rag.amerge_entities([src], target)
+
+        new_row = await rag.relation_chunks.get_by_id(
+            make_relation_chunk_key(target, other)
+        )
+        assert new_row is not None, "merged relation row should exist"
+        assert new_row.get("chunk_ids") == [live_chunk], (
+            "a partial relation row must be reseeded from source_id on merge, "
+            f"not persisted empty: {new_row}"
+        )
+    finally:
+        await rag.finalize_storages()
