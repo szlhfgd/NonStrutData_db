@@ -178,6 +178,15 @@
         "copyFailed": "فشل نسخ تفاصيل الحالة"
       }
     },
+    "librarySummary": {
+      "title": "ملخص المكتبة",
+      "total": "الإجمالي",
+      "completed": "مكتمل",
+      "processing": "قيد المعالجة",
+      "pending": "قيد الانتظار",
+      "failed": "فشل",
+      "progress": "دفعة {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "حالة خط الأنابيب",
       "busy": "خط الأنابيب مشغول",

@@ -178,6 +178,15 @@
         "copyFailed": "Statusdetails konnten nicht kopiert werden"
       }
     },
+    "librarySummary": {
+      "title": "Bibliotheksübersicht",
+      "total": "Gesamt",
+      "completed": "Abgeschlossen",
+      "processing": "In Verarbeitung",
+      "pending": "Ausstehend",
+      "failed": "Fehlgeschlagen",
+      "progress": "Stapel {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "Pipeline-Status",
       "busy": "Pipeline beschäftigt",

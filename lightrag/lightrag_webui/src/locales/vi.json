@@ -178,6 +178,15 @@
         "copyFailed": "Sao chép chi tiết trạng thái thất bại"
       }
     },
+    "librarySummary": {
+      "title": "Tóm tắt thư viện",
+      "total": "Tổng cộng",
+      "completed": "Hoàn thành",
+      "processing": "Đang xử lý",
+      "pending": "Đang chờ",
+      "failed": "Thất bại",
+      "progress": "Lô {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "Trạng Thái Quy Trình",
       "busy": "Quy Trình Đang Bận",

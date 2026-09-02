@@ -76,6 +76,7 @@
 ---
 
 ## 🎉 新闻
+
 - [2026.07]🎯[新功能]: 添加 Word 文档 **智能章节标题** 识别功能。
 - [2026.05]🎯[新功能]：**将 RagAnything 合并至 LightRAG**🎉。支持通过 **MinerU / Docling** 服务进行多模态内容解析与提取。
 - [2026.05]🎯[新功能]：引入四种可选的文本分块策略：`Fix`（固定）、`Recursive`（递归）、`Vector`（向量）和 `Paragraph`（段落语义）。
@@ -117,7 +118,7 @@
 **💡 使用 uv 进行包管理**: 本项目使用 [uv](https://docs.astral.sh/uv/) 进行快速可靠的 Python 包管理。首先安装 uv: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Unix/macOS) 或 `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows)
 
 > **注意**：如果您愿意，也可以使用 pip，但为了获得更好的性能 and 更可靠的依赖管理，建议使用 uv。
->
+> 
 > **📦 离线部署**: 对于离线或隔离环境，请参阅[离线部署指南](./docs/OfflineDeployment.md)，了解预安装所有依赖项和缓存文件的说明。
 
 ### 安装LightRAG服务器
@@ -195,9 +196,9 @@ docker compose up
 ```
 
 > 在此获取LightRAG docker镜像历史版本: [LightRAG Docker Images]( https://github.com/HKUDS/LightRAG/pkgs/container/lightrag)
->
+> 
 > 由 GitHub Actions 发布到 GHCR 的官方镜像已使用 GitHub OIDC 和 Sigstore Cosign 进行签名。校验方式请参阅 [docs/DockerDeployment.md](./docs/DockerDeployment.md#verify-official-ghcr-images-with-cosign)。
->
+> 
 > 在 Apple Silicon（macOS 26）上，无需 Docker Desktop 即可在 Apple 原生的 `container` 运行时上运行相同的 Postgres/Neo4j/Milvus 存储栈 —— 参见 [docs/AppleContainerSetup.md](./docs/AppleContainerSetup.md)。
 
 ### 使用设置向导创建 .env 文件
@@ -383,6 +384,7 @@ LightRAG 的默认存储全部都是基于文件进行持久化的内存数据�
 ### 文档查询阶段其他重要配置
 
 在文档查询阶段还有以下环境变量建议根据实际需要进行调整：
+
 - **MAX_ENTITY_TOKENS / MAX_RELATION_TOKENS / MAX_TOTAL_TOKENS**：控制召回内容送给LLM上下文的Token长度。召回内容包含`实体`、`关系`和`文本块`三部分，实体和关系的长度可以单独控制长度，文本块的长度由总长度减去实体和关系的长度来控制。
 - **ENABLE_CONTENT_HEADINGS**：控制是否把文本块所在的章节标题送给LLM；默认开启，可以为LLM提供更加丰富的上下文信息，提高回答质量。
 - **ENABLE_LLM_CACHE**：是否允许缓存查询结果。默认开启，相同的查询问题、查询模式、LLM模型参数将返回相同的结果。
@@ -443,29 +445,28 @@ LightRAG 在农业、计算机科学、法律和混合等领域均显著优于 N
 
 ### 总体性能表
 
-||**农业**||**计算机科学**||**法律**||**混合**||
-|----------------------|---------------|------------|------|------------|---------|------------|-------|------------|
-||NaiveRAG|**LightRAG**|NaiveRAG|**LightRAG**|NaiveRAG|**LightRAG**|NaiveRAG|**LightRAG**|
-|**全面性**|32.4%|**67.6%**|38.4%|**61.6%**|16.4%|**83.6%**|38.8%|**61.2%**|
-|**多样性**|23.6%|**76.4%**|38.0%|**62.0%**|13.6%|**86.4%**|32.4%|**67.6%**|
-|**赋能性**|32.4%|**67.6%**|38.8%|**61.2%**|16.4%|**83.6%**|42.8%|**57.2%**|
-|**总体**|32.4%|**67.6%**|38.8%|**61.2%**|15.2%|**84.8%**|40.0%|**60.0%**|
-||RQ-RAG|**LightRAG**|RQ-RAG|**LightRAG**|RQ-RAG|**LightRAG**|RQ-RAG|**LightRAG**|
-|**全面性**|31.6%|**68.4%**|38.8%|**61.2%**|15.2%|**84.8%**|39.2%|**60.8%**|
-|**多样性**|29.2%|**70.8%**|39.2%|**60.8%**|11.6%|**88.4%**|30.8%|**69.2%**|
-|**赋能性**|31.6%|**68.4%**|36.4%|**63.6%**|15.2%|**84.8%**|42.4%|**57.6%**|
-|**总体**|32.4%|**67.6%**|38.0%|**62.0%**|14.4%|**85.6%**|40.0%|**60.0%**|
-||HyDE|**LightRAG**|HyDE|**LightRAG**|HyDE|**LightRAG**|HyDE|**LightRAG**|
-|**全面性**|26.0%|**74.0%**|41.6%|**58.4%**|26.8%|**73.2%**|40.4%|**59.6%**|
-|**多样性**|24.0%|**76.0%**|38.8%|**61.2%**|20.0%|**80.0%**|32.4%|**67.6%**|
-|**赋能性**|25.2%|**74.8%**|40.8%|**59.2%**|26.0%|**74.0%**|46.0%|**54.0%**|
-|**总体**|24.8%|**75.2%**|41.6%|**58.4%**|26.4%|**73.6%**|42.4%|**57.6%**|
-||GraphRAG|**LightRAG**|GraphRAG|**LightRAG**|GraphRAG|**LightRAG**|GraphRAG|**LightRAG**|
-|**全面性**|45.6%|**54.4%**|48.4%|**51.6%**|48.4%|**51.6%**|**50.4%**|49.6%|
-|**多样性**|22.8%|**77.2%**|40.8%|**59.2%**|26.4%|**73.6%**|36.0%|**64.0%**|
-|**赋能性**|41.2%|**58.8%**|45.2%|**54.8%**|43.6%|**56.4%**|**50.8%**|49.2%|
-|**总体**|45.2%|**54.8%**|48.0%|**52.0%**|47.2%|**52.8%**|**50.4%**|49.6%|
-
+|         | **农业**   |              | **计算机科学** |              | **法律**   |              | **混合**    |              |
+| ------- | -------- | ------------ | --------- | ------------ | -------- | ------------ | --------- | ------------ |
+|         | NaiveRAG | **LightRAG** | NaiveRAG  | **LightRAG** | NaiveRAG | **LightRAG** | NaiveRAG  | **LightRAG** |
+| **全面性** | 32.4%    | **67.6%**    | 38.4%     | **61.6%**    | 16.4%    | **83.6%**    | 38.8%     | **61.2%**    |
+| **多样性** | 23.6%    | **76.4%**    | 38.0%     | **62.0%**    | 13.6%    | **86.4%**    | 32.4%     | **67.6%**    |
+| **赋能性** | 32.4%    | **67.6%**    | 38.8%     | **61.2%**    | 16.4%    | **83.6%**    | 42.8%     | **57.2%**    |
+| **总体**  | 32.4%    | **67.6%**    | 38.8%     | **61.2%**    | 15.2%    | **84.8%**    | 40.0%     | **60.0%**    |
+|         | RQ-RAG   | **LightRAG** | RQ-RAG    | **LightRAG** | RQ-RAG   | **LightRAG** | RQ-RAG    | **LightRAG** |
+| **全面性** | 31.6%    | **68.4%**    | 38.8%     | **61.2%**    | 15.2%    | **84.8%**    | 39.2%     | **60.8%**    |
+| **多样性** | 29.2%    | **70.8%**    | 39.2%     | **60.8%**    | 11.6%    | **88.4%**    | 30.8%     | **69.2%**    |
+| **赋能性** | 31.6%    | **68.4%**    | 36.4%     | **63.6%**    | 15.2%    | **84.8%**    | 42.4%     | **57.6%**    |
+| **总体**  | 32.4%    | **67.6%**    | 38.0%     | **62.0%**    | 14.4%    | **85.6%**    | 40.0%     | **60.0%**    |
+|         | HyDE     | **LightRAG** | HyDE      | **LightRAG** | HyDE     | **LightRAG** | HyDE      | **LightRAG** |
+| **全面性** | 26.0%    | **74.0%**    | 41.6%     | **58.4%**    | 26.8%    | **73.2%**    | 40.4%     | **59.6%**    |
+| **多样性** | 24.0%    | **76.0%**    | 38.8%     | **61.2%**    | 20.0%    | **80.0%**    | 32.4%     | **67.6%**    |
+| **赋能性** | 25.2%    | **74.8%**    | 40.8%     | **59.2%**    | 26.0%    | **74.0%**    | 46.0%     | **54.0%**    |
+| **总体**  | 24.8%    | **75.2%**    | 41.6%     | **58.4%**    | 26.4%    | **73.6%**    | 42.4%     | **57.6%**    |
+|         | GraphRAG | **LightRAG** | GraphRAG  | **LightRAG** | GraphRAG | **LightRAG** | GraphRAG  | **LightRAG** |
+| **全面性** | 45.6%    | **54.4%**    | 48.4%     | **51.6%**    | 48.4%    | **51.6%**    | **50.4%** | 49.6%        |
+| **多样性** | 22.8%    | **77.2%**    | 40.8%     | **59.2%**    | 26.4%    | **73.6%**    | 36.0%     | **64.0%**    |
+| **赋能性** | 41.2%    | **58.8%**    | 45.2%     | **54.8%**    | 43.6%    | **56.4%**    | **50.8%** | 49.2%        |
+| **总体**  | 45.2%    | **54.8%**    | 48.0%     | **52.0%**    | 47.2%    | **52.8%**    | **50.4%** | 49.6%        |
 
 ## 📚 文档与工具清单
 
@@ -475,48 +476,48 @@ LightRAG 在农业、计算机科学、法律和混合等领域均显著优于 N
 
 **部署与安装**
 
-| 文档 | 内容 |
-|---|---|
-| [InteractiveSetup.md](./docs/InteractiveSetup.md) | `make env-*` 安装向导：生成 `.env` 以及由向导管理的 `docker-compose.final.yml` |
-| [DockerDeployment.md](./docs/DockerDeployment.md) | Docker / Docker Compose 部署、镜像版本差异，以及用 Cosign 验证官方 GHCR 镜像 |
+| 文档                                                      | 内容                                                                                           |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| [InteractiveSetup.md](./docs/InteractiveSetup.md)       | `make env-*` 安装向导：生成 `.env` 以及由向导管理的 `docker-compose.final.yml`                              |
+| [DockerDeployment.md](./docs/DockerDeployment.md)       | Docker / Docker Compose 部署、镜像版本差异，以及用 Cosign 验证官方 GHCR 镜像                                    |
 | [AppleContainerSetup.md](./docs/AppleContainerSetup.md) | 在 Apple 原生 `container` 运行时上运行 Postgres / Neo4j / Milvus 存储栈（Apple Silicon，无需 Docker Desktop） |
-| [OfflineDeployment.md](./docs/OfflineDeployment.md) | 离线/内网环境部署：预装依赖、tiktoken 缓存与 spaCy 模型 |
-| [MultiSiteDeployment.md](./docs/MultiSiteDeployment.md) | 单机反向代理后运行多个相互隔离的实例，共用一份 WebUI 构建产物（`LIGHTRAG_API_PREFIX`） |
-| [FrontendBuildGuide.md](./docs/FrontendBuildGuide.md) | WebUI 的构建与分发方式（Bun / Node），以及哪些安装场景需要自行构建 |
+| [OfflineDeployment.md](./docs/OfflineDeployment.md)     | 离线/内网环境部署：预装依赖、tiktoken 缓存与 spaCy 模型                                                         |
+| [MultiSiteDeployment.md](./docs/MultiSiteDeployment.md) | 单机反向代理后运行多个相互隔离的实例，共用一份 WebUI 构建产物（`LIGHTRAG_API_PREFIX`）                                    |
+| [FrontendBuildGuide.md](./docs/FrontendBuildGuide.md)   | WebUI 的构建与分发方式（Bun / Node），以及哪些安装场景需要自行构建                                                    |
 
 **服务器与 API**
 
-| 文档 | 内容 |
-|---|---|
+| 文档                                                            | 内容                                 |
+| ------------------------------------------------------------- | ---------------------------------- |
 | [LightRAG-API-Server-zh.md](./docs/LightRAG-API-Server-zh.md) | 服务器完整指南：启动、配置、认证、REST 接口与 WebUI 使用 |
 
 **文档处理**
 
-| 文档 | 内容 |
-|---|---|
-| [FileProcessingPipeline-zh.md](./docs/FileProcessingPipeline-zh.md) | 流水线规格说明：`LIGHTRAG_PARSER` 路由规则、各引擎参数、多模态分析、文档状态生命周期 |
-| [ParserServiceDeployment-zh.md](./docs/ParserServiceDeployment-zh.md) | 自行搭建 MinerU 与 docling-serve 外部解析服务（Docker、GPU、模型权重） |
-| [ParagraphSemanticChunking-zh.md](./docs/ParagraphSemanticChunking-zh.md) | `Paragraph semantic (P)` 分块策略：对齐标题/段落/表格边界、参考文献丢弃 |
-| [LightRAGSidecarFormat-zh.md](./docs/LightRAGSidecarFormat-zh.md) | sidecar（`*.parsed/`）交换格式规范，所有支持多模态的解析引擎都必须遵循 |
-| [ThirdPartyParser-zh.md](./docs/ThirdPartyParser-zh.md) | 开发并注册自定义 parser 引擎 |
-| [ParserDebugCLI-zh.md](./docs/ParserDebugCLI-zh.md) | `python -m lightrag.parser.cli` —— 脱离服务器离线解析单个文件并查看结果 |
+| 文档                                                                        | 内容                                                    |
+| ------------------------------------------------------------------------- | ----------------------------------------------------- |
+| [FileProcessingPipeline-zh.md](./docs/FileProcessingPipeline-zh.md)       | 流水线规格说明：`LIGHTRAG_PARSER` 路由规则、各引擎参数、多模态分析、文档状态生命周期   |
+| [ParserServiceDeployment-zh.md](./docs/ParserServiceDeployment-zh.md)     | 自行搭建 MinerU 与 docling-serve 外部解析服务（Docker、GPU、模型权重）   |
+| [ParagraphSemanticChunking-zh.md](./docs/ParagraphSemanticChunking-zh.md) | `Paragraph semantic (P)` 分块策略：对齐标题/段落/表格边界、参考文献丢弃     |
+| [LightRAGSidecarFormat-zh.md](./docs/LightRAGSidecarFormat-zh.md)         | sidecar（`*.parsed/`）交换格式规范，所有支持多模态的解析引擎都必须遵循          |
+| [ThirdPartyParser-zh.md](./docs/ThirdPartyParser-zh.md)                   | 开发并注册自定义 parser 引擎                                    |
+| [ParserDebugCLI-zh.md](./docs/ParserDebugCLI-zh.md)                       | `python -m lightrag.parser.cli` —— 脱离服务器离线解析单个文件并查看结果 |
 
 **模型与存储**
 
-| 文档 | 内容 |
-|---|---|
-| [RoleSpecificLLMConfiguration-zh.md](./docs/RoleSpecificLLMConfiguration-zh.md) | 按角色（`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`）配置 LLM 与 VLM |
-| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | provider 生成参数完整参考（`OPENAI_LLM_*`、`OLLAMA_LLM_*`、`GEMINI_LLM_*`、`BEDROCK_LLM_*`、`*_EMBEDDING_*`，英文） |
-| [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | 查询/文档非对称 embedding（`EMBEDDING_ASYMMETRIC`）与各模型的前缀 |
-| [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | 通过 `vector_db_storage_cls_kwargs` 调整 Milvus 索引参数 |
+| 文档                                                                              | 内容                                                                                                 |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| [RoleSpecificLLMConfiguration-zh.md](./docs/RoleSpecificLLMConfiguration-zh.md) | 按角色（`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`）配置 LLM 与 VLM                                           |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md)                           | provider 生成参数完整参考（`OPENAI_LLM_*`、`OLLAMA_LLM_*`、`GEMINI_LLM_*`、`BEDROCK_LLM_*`、`*_EMBEDDING_*`，英文） |
+| [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md)                         | 查询/文档非对称 embedding（`EMBEDDING_ASYMMETRIC`）与各模型的前缀                                                  |
+| [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md)               | 通过 `vector_db_storage_cls_kwargs` 调整 Milvus 索引参数                                                   |
 
 **SDK 与开发**
 
-| 文档 | 内容 |
-|---|---|
+| 文档                                                    | 内容                                          |
+| ----------------------------------------------------- | ------------------------------------------- |
 | [ProgramingWithCore.md](./docs/ProgramingWithCore.md) | 以 Python SDK 方式使用 LightRAG，包含未通过 REST 暴露的功能 |
-| [Reproduce.md](./docs/Reproduce.md) | 复现论文中的评测结果 |
-| [UV_LOCK_GUIDE.md](./docs/UV_LOCK_GUIDE.md) | 何时以及如何更新 `uv.lock` |
+| [Reproduce.md](./docs/Reproduce.md)                   | 复现论文中的评测结果                                  |
+| [UV_LOCK_GUIDE.md](./docs/UV_LOCK_GUIDE.md)           | 何时以及如何更新 `uv.lock`                          |
 
 ### 运维工具（`lightrag/tools/`）
 
@@ -612,7 +613,6 @@ SDK 诊断工具：校验 `LightRAG` 实例是否已完整初始化，用于排�
     <img src="https://contrib.rocks/image?repo=HKUDS/LightRAG" style="border-radius: 15px; box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);" />
   </a>
 </div>
-
 
 ## 📖 引用
 

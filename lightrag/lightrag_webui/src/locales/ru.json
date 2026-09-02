@@ -178,6 +178,15 @@
         "copyFailed": "Не удалось скопировать сведения о статусе"
       }
     },
+    "librarySummary": {
+      "title": "Сводка по библиотеке",
+      "total": "Всего",
+      "completed": "Завершено",
+      "processing": "В обработке",
+      "pending": "Ожидание",
+      "failed": "Ошибки",
+      "progress": "Пакет {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "Статус конвейера",
       "busy": "Конвейер занят",

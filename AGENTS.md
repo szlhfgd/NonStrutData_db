@@ -1,12 +1,12 @@
 # Repository Instructions
 
-This is a fork working copy. The root contains only a placeholder `main.py`; **all project code lives in `lightrag/`**. Run all commands from `lightrag/` unless noted otherwise.
+This is a fork working copy. The root holds only launcher/docs (`ui.cmd`, `AGENTS.md`, `CONTEXT.md`, `docs/`, `.scratch/`); **all project code lives in `lightrag/`** (a nested git repo). Run all commands from `lightrag/` unless noted otherwise.
 
 ## Quick Reference
 
 | What             | How                                                                                |
 | ---------------- | ---------------------------------------------------------------------------------- |
-| Install deps     | `cd lightrag && uv sync --extra test`                                              |
+| Install deps     | `cd lightrag &&  sync --extra test`                                                |
 | Lint             | `cd lightrag && ruff check .`                                                      |
 | Run subset tests | `cd lightrag && ./scripts/test.sh tests/<dir>` (mirrors changed module)            |
 | Full test suite  | `cd lightrag && ./scripts/test.sh tests` (~7000 tests, >6 min)                     |
@@ -40,3 +40,18 @@ Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `
 ### Domain docs
 
 Single-context layout: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
+Content
+
+```
+NonStrutData_db/            # 仓库根（fork 工作副本，非代码本体）
+├── ui.cmd                  # 一键启动/关闭 WebUI + 后端（Windows）
+├── AGENTS.md / CONTEXT.md  # 仓库说明与领域术语
+├── docs/                   # 本地 agent 工作流文档
+├── .scratch/               # 本地 markdown issue 追踪器
+├── .env/                   # 存放 API_KEY（未提交）
+└── lightrag/               # ★ 项目本体（嵌套 git 仓库，见上）
+    ├── lightrag/           #   Python 核心包（业务编排：LightRAG、存储、LLM、解析器）
+    ├── lightrag_webui/     #   前端 UI 层（React + TypeScript）
+    ├── tests/              #   pytest 测试
+    └── ...                 #   scripts / docs / examples / env.example 等
+```

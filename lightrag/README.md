@@ -76,6 +76,7 @@
 ---
 
 ## 🎉 News
+
 - [2026.07]🎯[New Feature]: Add **Smart Heading** recognition feature for word documents.
 - [2026.05]🎯[New Feature]: **Merge RagAnything into LightRAG**🎉. Multimodal content parsing and extraction via **MinerU / Docling** services.
 - [2026.05]🎯[New Feature]: Introducing four selectable text chunking strategies: `Fix`, `Recursive`, `Vector`, and `Paragraph`.
@@ -117,7 +118,7 @@
 **💡 Using uv for Package Management**: This project uses [uv](https://docs.astral.sh/uv/) for fast and reliable Python package management. Install uv first: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Unix/macOS) or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows)
 
 > **Note**: You can also use pip if you prefer, but uv is recommended for better performance and more reliable dependency management.
->
+> 
 > **📦 Offline Deployment**: For offline or air-gapped environments, see the [Offline Deployment Guide](./docs/OfflineDeployment.md) for instructions on pre-installing all dependencies and cache files.
 
 ### Install LightRAG Server
@@ -195,9 +196,9 @@ docker compose up
 ```
 
 > Historical versions of LightRAG docker images can be found here: [LightRAG Docker Images]( https://github.com/HKUDS/LightRAG/pkgs/container/lightrag)
->
+> 
 > Official GHCR images published by GitHub Actions are signed with Sigstore Cosign using GitHub OIDC. See [docs/DockerDeployment.md](./docs/DockerDeployment.md#verify-official-ghcr-images-with-cosign) for verification commands.
->
+> 
 > On Apple Silicon (macOS 26) without Docker Desktop, you can run the same Postgres/Neo4j/Milvus storage stack on Apple's native `container` runtime — see [docs/AppleContainerSetup.md](./docs/AppleContainerSetup.md).
 
 ### Create .env File With Setup Tool
@@ -383,6 +384,7 @@ LLM timeouts during entity-relation extraction usually trace back to one of thre
 ### Other Important Configurations for Document Querying
 
 During the document query stage, you may also want to adjust the following environment variables based on your needs:
+
 - **MAX_ENTITY_TOKENS / MAX_RELATION_TOKENS / MAX_TOTAL_TOKENS**: Controls the token length of the retrieved content sent to the LLM context. The retrieved content consists of three parts: `entities`, `relations`, and `text chunks`. The lengths of entities and relations can be controlled independently, while the text chunk length is determined by subtracting the entity and relation lengths from the total length.
 - **ENABLE_CONTENT_HEADINGS**: Controls whether the section heading where a text chunk resides is sent to the LLM; enabled by default, providing richer context for the LLM and improving answer quality.
 - **ENABLE_LLM_CACHE**: Whether to cache query results. Enabled by default; identical query questions, query modes, and LLM model parameters will return the same result.
@@ -443,29 +445,28 @@ LightRAG consistently outperforms NaiveRAG, RQ-RAG, HyDE, and GraphRAG across ag
 
 **Overall Performance Table**
 
-||**Agriculture**||**CS**||**Legal**||**Mix**||
-|----------------------|---------------|------------|------|------------|---------|------------|-------|------------|
-||NaiveRAG|**LightRAG**|NaiveRAG|**LightRAG**|NaiveRAG|**LightRAG**|NaiveRAG|**LightRAG**|
-|**Comprehensiveness**|32.4%|**67.6%**|38.4%|**61.6%**|16.4%|**83.6%**|38.8%|**61.2%**|
-|**Diversity**|23.6%|**76.4%**|38.0%|**62.0%**|13.6%|**86.4%**|32.4%|**67.6%**|
-|**Empowerment**|32.4%|**67.6%**|38.8%|**61.2%**|16.4%|**83.6%**|42.8%|**57.2%**|
-|**Overall**|32.4%|**67.6%**|38.8%|**61.2%**|15.2%|**84.8%**|40.0%|**60.0%**|
-||RQ-RAG|**LightRAG**|RQ-RAG|**LightRAG**|RQ-RAG|**LightRAG**|RQ-RAG|**LightRAG**|
-|**Comprehensiveness**|31.6%|**68.4%**|38.8%|**61.2%**|15.2%|**84.8%**|39.2%|**60.8%**|
-|**Diversity**|29.2%|**70.8%**|39.2%|**60.8%**|11.6%|**88.4%**|30.8%|**69.2%**|
-|**Empowerment**|31.6%|**68.4%**|36.4%|**63.6%**|15.2%|**84.8%**|42.4%|**57.6%**|
-|**Overall**|32.4%|**67.6%**|38.0%|**62.0%**|14.4%|**85.6%**|40.0%|**60.0%**|
-||HyDE|**LightRAG**|HyDE|**LightRAG**|HyDE|**LightRAG**|HyDE|**LightRAG**|
-|**Comprehensiveness**|26.0%|**74.0%**|41.6%|**58.4%**|26.8%|**73.2%**|40.4%|**59.6%**|
-|**Diversity**|24.0%|**76.0%**|38.8%|**61.2%**|20.0%|**80.0%**|32.4%|**67.6%**|
-|**Empowerment**|25.2%|**74.8%**|40.8%|**59.2%**|26.0%|**74.0%**|46.0%|**54.0%**|
-|**Overall**|24.8%|**75.2%**|41.6%|**58.4%**|26.4%|**73.6%**|42.4%|**57.6%**|
-||GraphRAG|**LightRAG**|GraphRAG|**LightRAG**|GraphRAG|**LightRAG**|GraphRAG|**LightRAG**|
-|**Comprehensiveness**|45.6%|**54.4%**|48.4%|**51.6%**|48.4%|**51.6%**|**50.4%**|49.6%|
-|**Diversity**|22.8%|**77.2%**|40.8%|**59.2%**|26.4%|**73.6%**|36.0%|**64.0%**|
-|**Empowerment**|41.2%|**58.8%**|45.2%|**54.8%**|43.6%|**56.4%**|**50.8%**|49.2%|
-|**Overall**|45.2%|**54.8%**|48.0%|**52.0%**|47.2%|**52.8%**|**50.4%**|49.6%|
-
+|                       | **Agriculture** |              | **CS**   |              | **Legal** |              | **Mix**   |              |
+| --------------------- | --------------- | ------------ | -------- | ------------ | --------- | ------------ | --------- | ------------ |
+|                       | NaiveRAG        | **LightRAG** | NaiveRAG | **LightRAG** | NaiveRAG  | **LightRAG** | NaiveRAG  | **LightRAG** |
+| **Comprehensiveness** | 32.4%           | **67.6%**    | 38.4%    | **61.6%**    | 16.4%     | **83.6%**    | 38.8%     | **61.2%**    |
+| **Diversity**         | 23.6%           | **76.4%**    | 38.0%    | **62.0%**    | 13.6%     | **86.4%**    | 32.4%     | **67.6%**    |
+| **Empowerment**       | 32.4%           | **67.6%**    | 38.8%    | **61.2%**    | 16.4%     | **83.6%**    | 42.8%     | **57.2%**    |
+| **Overall**           | 32.4%           | **67.6%**    | 38.8%    | **61.2%**    | 15.2%     | **84.8%**    | 40.0%     | **60.0%**    |
+|                       | RQ-RAG          | **LightRAG** | RQ-RAG   | **LightRAG** | RQ-RAG    | **LightRAG** | RQ-RAG    | **LightRAG** |
+| **Comprehensiveness** | 31.6%           | **68.4%**    | 38.8%    | **61.2%**    | 15.2%     | **84.8%**    | 39.2%     | **60.8%**    |
+| **Diversity**         | 29.2%           | **70.8%**    | 39.2%    | **60.8%**    | 11.6%     | **88.4%**    | 30.8%     | **69.2%**    |
+| **Empowerment**       | 31.6%           | **68.4%**    | 36.4%    | **63.6%**    | 15.2%     | **84.8%**    | 42.4%     | **57.6%**    |
+| **Overall**           | 32.4%           | **67.6%**    | 38.0%    | **62.0%**    | 14.4%     | **85.6%**    | 40.0%     | **60.0%**    |
+|                       | HyDE            | **LightRAG** | HyDE     | **LightRAG** | HyDE      | **LightRAG** | HyDE      | **LightRAG** |
+| **Comprehensiveness** | 26.0%           | **74.0%**    | 41.6%    | **58.4%**    | 26.8%     | **73.2%**    | 40.4%     | **59.6%**    |
+| **Diversity**         | 24.0%           | **76.0%**    | 38.8%    | **61.2%**    | 20.0%     | **80.0%**    | 32.4%     | **67.6%**    |
+| **Empowerment**       | 25.2%           | **74.8%**    | 40.8%    | **59.2%**    | 26.0%     | **74.0%**    | 46.0%     | **54.0%**    |
+| **Overall**           | 24.8%           | **75.2%**    | 41.6%    | **58.4%**    | 26.4%     | **73.6%**    | 42.4%     | **57.6%**    |
+|                       | GraphRAG        | **LightRAG** | GraphRAG | **LightRAG** | GraphRAG  | **LightRAG** | GraphRAG  | **LightRAG** |
+| **Comprehensiveness** | 45.6%           | **54.4%**    | 48.4%    | **51.6%**    | 48.4%     | **51.6%**    | **50.4%** | 49.6%        |
+| **Diversity**         | 22.8%           | **77.2%**    | 40.8%    | **59.2%**    | 26.4%     | **73.6%**    | 36.0%     | **64.0%**    |
+| **Empowerment**       | 41.2%           | **58.8%**    | 45.2%    | **54.8%**    | 43.6%     | **56.4%**    | **50.8%** | 49.2%        |
+| **Overall**           | 45.2%           | **54.8%**    | 48.0%    | **52.0%**    | 47.2%     | **52.8%**    | **50.4%** | 49.6%        |
 
 ## 📚 Documentation and Tools
 
@@ -475,48 +476,48 @@ Entries marked 🇨🇳 also ship a Chinese translation as `*-zh.md` in the same
 
 **Deployment and Setup**
 
-| Document | What it covers |
-|---|---|
-| [InteractiveSetup.md](./docs/InteractiveSetup.md) | The `make env-*` setup wizard: generating `.env` and the wizard-managed `docker-compose.final.yml` |
-| [DockerDeployment.md](./docs/DockerDeployment.md) | Docker / Docker Compose deployment, image variants, and Cosign verification of the official GHCR images |
+| Document                                                | What it covers                                                                                                               |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| [InteractiveSetup.md](./docs/InteractiveSetup.md)       | The `make env-*` setup wizard: generating `.env` and the wizard-managed `docker-compose.final.yml`                           |
+| [DockerDeployment.md](./docs/DockerDeployment.md)       | Docker / Docker Compose deployment, image variants, and Cosign verification of the official GHCR images                      |
 | [AppleContainerSetup.md](./docs/AppleContainerSetup.md) | Running the Postgres / Neo4j / Milvus storage stack on Apple's native `container` runtime (Apple Silicon, no Docker Desktop) |
-| [OfflineDeployment.md](./docs/OfflineDeployment.md) | Air-gapped installs: pre-installing dependencies, the tiktoken cache, and the spaCy models |
-| [MultiSiteDeployment.md](./docs/MultiSiteDeployment.md) | Several isolated instances behind one reverse proxy, sharing a single WebUI build (`LIGHTRAG_API_PREFIX`) |
-| [FrontendBuildGuide.md](./docs/FrontendBuildGuide.md) | How the WebUI is built and shipped (Bun / Node), and which install scenarios require a build |
+| [OfflineDeployment.md](./docs/OfflineDeployment.md)     | Air-gapped installs: pre-installing dependencies, the tiktoken cache, and the spaCy models                                   |
+| [MultiSiteDeployment.md](./docs/MultiSiteDeployment.md) | Several isolated instances behind one reverse proxy, sharing a single WebUI build (`LIGHTRAG_API_PREFIX`)                    |
+| [FrontendBuildGuide.md](./docs/FrontendBuildGuide.md)   | How the WebUI is built and shipped (Bun / Node), and which install scenarios require a build                                 |
 
 **Server and API**
 
-| Document | What it covers |
-|---|---|
+| Document                                                                                         | What it covers                                                                                     |
+| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
 | [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md) [🇨🇳](./docs/LightRAG-API-Server-zh.md) | The complete server guide: startup, configuration, authentication, REST endpoints, and WebUI usage |
 
 **Document Processing**
 
-| Document | What it covers |
-|---|---|
-| [FileProcessingPipeline.md](./docs/FileProcessingPipeline.md) [🇨🇳](./docs/FileProcessingPipeline-zh.md) | Pipeline specification: `LIGHTRAG_PARSER` routing rules, per-engine parameters, multimodal analysis, document status lifecycle |
-| [ParserServiceDeployment.md](./docs/ParserServiceDeployment.md) [🇨🇳](./docs/ParserServiceDeployment-zh.md) | Self-hosting the external MinerU and docling-serve parsing services (Docker, GPU, model weights) |
-| [ParagraphSemanticChunking.md](./docs/ParagraphSemanticChunking.md) [🇨🇳](./docs/ParagraphSemanticChunking-zh.md) | The `Paragraph semantic (P)` chunking strategy: heading/paragraph/table-aware boundaries, reference dropping |
-| [LightRAGSidecarFormat.md](./docs/LightRAGSidecarFormat.md) [🇨🇳](./docs/LightRAGSidecarFormat-zh.md) | The sidecar (`*.parsed/`) interchange format every multimodal-capable parser engine must emit |
-| [ThirdPartyParser.md](./docs/ThirdPartyParser.md) [🇨🇳](./docs/ThirdPartyParser-zh.md) | Developing and registering your own parser engine |
-| [ParserDebugCLI.md](./docs/ParserDebugCLI.md) [🇨🇳](./docs/ParserDebugCLI-zh.md) | `python -m lightrag.parser.cli` — parse a single file offline and inspect the result without a server |
+| Document                                                                                                           | What it covers                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| [FileProcessingPipeline.md](./docs/FileProcessingPipeline.md) [🇨🇳](./docs/FileProcessingPipeline-zh.md)          | Pipeline specification: `LIGHTRAG_PARSER` routing rules, per-engine parameters, multimodal analysis, document status lifecycle |
+| [ParserServiceDeployment.md](./docs/ParserServiceDeployment.md) [🇨🇳](./docs/ParserServiceDeployment-zh.md)       | Self-hosting the external MinerU and docling-serve parsing services (Docker, GPU, model weights)                               |
+| [ParagraphSemanticChunking.md](./docs/ParagraphSemanticChunking.md) [🇨🇳](./docs/ParagraphSemanticChunking-zh.md) | The `Paragraph semantic (P)` chunking strategy: heading/paragraph/table-aware boundaries, reference dropping                   |
+| [LightRAGSidecarFormat.md](./docs/LightRAGSidecarFormat.md) [🇨🇳](./docs/LightRAGSidecarFormat-zh.md)             | The sidecar (`*.parsed/`) interchange format every multimodal-capable parser engine must emit                                  |
+| [ThirdPartyParser.md](./docs/ThirdPartyParser.md) [🇨🇳](./docs/ThirdPartyParser-zh.md)                            | Developing and registering your own parser engine                                                                              |
+| [ParserDebugCLI.md](./docs/ParserDebugCLI.md) [🇨🇳](./docs/ParserDebugCLI-zh.md)                                  | `python -m lightrag.parser.cli` — parse a single file offline and inspect the result without a server                          |
 
 **Models and Storage**
 
-| Document | What it covers |
-|---|---|
-| [RoleSpecificLLMConfiguration.md](./docs/RoleSpecificLLMConfiguration.md) [🇨🇳](./docs/RoleSpecificLLMConfiguration-zh.md) | Per-role (`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`) LLM and VLM configuration |
-| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | Complete reference for provider generation options (`OPENAI_LLM_*`, `OLLAMA_LLM_*`, `GEMINI_LLM_*`, `BEDROCK_LLM_*`, `*_EMBEDDING_*`) |
-| [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | Query/document asymmetric embedding (`EMBEDDING_ASYMMETRIC`) and per-model prefixes |
-| [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | Tuning Milvus index parameters through `vector_db_storage_cls_kwargs` |
+| Document                                                                                                                    | What it covers                                                                                                                        |
+| --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| [RoleSpecificLLMConfiguration.md](./docs/RoleSpecificLLMConfiguration.md) [🇨🇳](./docs/RoleSpecificLLMConfiguration-zh.md) | Per-role (`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`) LLM and VLM configuration                                                          |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md)                                                                       | Complete reference for provider generation options (`OPENAI_LLM_*`, `OLLAMA_LLM_*`, `GEMINI_LLM_*`, `BEDROCK_LLM_*`, `*_EMBEDDING_*`) |
+| [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md)                                                                     | Query/document asymmetric embedding (`EMBEDDING_ASYMMETRIC`) and per-model prefixes                                                   |
+| [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md)                                                           | Tuning Milvus index parameters through `vector_db_storage_cls_kwargs`                                                                 |
 
 **SDK and Development**
 
-| Document | What it covers |
-|---|---|
+| Document                                              | What it covers                                                                    |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------- |
 | [ProgramingWithCore.md](./docs/ProgramingWithCore.md) | Using LightRAG as a Python SDK, including features that are not exposed over REST |
-| [Reproduce.md](./docs/Reproduce.md) | Reproducing the evaluation results reported in the paper |
-| [UV_LOCK_GUIDE.md](./docs/UV_LOCK_GUIDE.md) | When and how to update `uv.lock` |
+| [Reproduce.md](./docs/Reproduce.md)                   | Reproducing the evaluation results reported in the paper                          |
+| [UV_LOCK_GUIDE.md](./docs/UV_LOCK_GUIDE.md)           | When and how to update `uv.lock`                                                  |
 
 ### Maintenance Tools (`lightrag/tools/`)
 
@@ -612,7 +613,6 @@ SDK diagnostic: verifies that a `LightRAG` instance is fully initialized, catchi
     <img src="https://contrib.rocks/image?repo=HKUDS/LightRAG" style="border-radius: 15px; box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);" />
   </a>
 </div>
-
 
 ## 📖 Citation
 

@@ -44,6 +44,7 @@ import { copyToClipboard } from '@/utils/clipboard'
 
 import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info, CopyIcon } from 'lucide-react'
 import PipelineStatusDialog from '@/components/documents/PipelineStatusDialog'
+import LibrarySummaryPrototype from '@/components/documents/LibrarySummaryPrototype'
 import {
   getStatusBucket,
   getStatusRequestFilters,
@@ -1374,6 +1375,7 @@ export default function DocumentManager() {
         <CardTitle className="text-lg">{t('documentPanel.documentManager.title')}</CardTitle>
       </CardHeader>
       <CardContent className="flex-1 flex flex-col min-h-0 overflow-auto">
+        <LibrarySummaryPrototype statusCounts={statusCounts} />
         <div className="flex justify-between items-center gap-2 mb-2">
           <div className="flex gap-2">
             <Button

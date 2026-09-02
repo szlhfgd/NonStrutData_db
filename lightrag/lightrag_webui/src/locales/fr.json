@@ -178,6 +178,15 @@
         "copyFailed": "Échec de la copie des détails du statut"
       }
     },
+    "librarySummary": {
+      "title": "Résumé de la bibliothèque",
+      "total": "Total",
+      "completed": "Terminés",
+      "processing": "En traitement",
+      "pending": "En attente",
+      "failed": "Échoués",
+      "progress": "Lot {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "État du Pipeline",
       "busy": "Pipeline Occupé",

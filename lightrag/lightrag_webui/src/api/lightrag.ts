@@ -2,9 +2,36 @@ import axios, { AxiosError } from 'axios'
 import { backendBaseUrl, popularLabelsDefaultLimit, searchLabelsDefaultLimit } from '@/lib/constants'
 import type { SupportedFileTypes } from '@/lib/fileTypes'
 import { errorMessage } from '@/lib/utils'
-import { useSettingsStore } from '@/stores/settings'
-import { useAuthStore } from '@/stores/state'
-import { navigationService } from '@/services/navigation'
+
+// Transport seam: injected credentials + auth events so the client never
+// reaches into app stores or the router. See configureTransport below.
+export type TransportCredentials = {
+  apiKey: string | null
+  isGuestMode: boolean
+  isAuthenticated: boolean
+}
+
+export type TransportAuthEvent =
+  | { type: 'guestTokenRefreshed'; token: string; coreVersion?: string | null; apiVersion?: string | null; webuiTitle?: string | null; webuiDescription?: string | null }
+  | { type: 'tokenRenewed'; expiresAt: number }
+  | { type: 'unauthorized' }
+
+export type TransportSeam = {
+  getCredentials: () => TransportCredentials
+  onAuthEvent: (event: TransportAuthEvent) => void
+}
+
+let getCredentials: () => TransportCredentials = () => ({
+  apiKey: null,
+  isGuestMode: false,
+  isAuthenticated: false,
+})
+let onAuthEvent: (event: TransportAuthEvent) => void = () => {}
+
+export const configureTransport = (seam: TransportSeam): void => {
+  getCredentials = seam.getCredentials
+  onAuthEvent = seam.onAuthEvent
+}
 
 // Types
 export type LightragNodeType = {
@@ -393,15 +420,14 @@ const silentRefreshGuestToken = async (): Promise<string> => {
         const newToken = response.data.access_token;
         // Update localStorage
         localStorage.setItem('LIGHTRAG-API-TOKEN', newToken);
-        // Update auth state
-        useAuthStore.getState().login(
-          newToken,
-          true,
-          response.data.core_version,
-          response.data.api_version,
-          response.data.webui_title || null,
-          response.data.webui_description || null
-        );
+        onAuthEvent({
+          type: 'guestTokenRefreshed',
+          token: newToken,
+          coreVersion: response.data.core_version,
+          apiVersion: response.data.api_version,
+          webuiTitle: response.data.webui_title || null,
+          webuiDescription: response.data.webui_description || null,
+        });
         return newToken;
       } else {
         throw new Error('Failed to get guest token');
@@ -423,7 +449,7 @@ axiosInstance.interceptors.request.use((config) => {
     return config;
   }
 
-  const apiKey = useSettingsStore.getState().apiKey
+  const apiKey = getCredentials().apiKey
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
 
   // Always include token if it exists, regardless of path
@@ -452,19 +478,10 @@ axiosInstance.interceptors.response.use(
       // Update auth state with renewal tracking
       try {
         const payload = JSON.parse(atob(newToken.split('.')[1]));
-        const authStore = useAuthStore.getState();
-        if (authStore.isAuthenticated) {
+        if (getCredentials().isAuthenticated) {
           // Track token renewal time and expiration
-          const renewalTime = Date.now();
           const expiresAt = payload.exp ? payload.exp * 1000 : 0;
-          authStore.setTokenRenewal(renewalTime, expiresAt);
-
-          // Update username (usually unchanged, but just in case)
-          const newUsername = payload.sub;
-          if (newUsername && newUsername !== authStore.username) {
-            // Need to add setUsername method or just update via login
-            // For now, we'll skip username update as it's rare
-          }
+          onAuthEvent({ type: 'tokenRenewed', expiresAt });
         }
       } catch (error) {
         console.warn('[Auth] Failed to parse renewed token:', error);
@@ -486,14 +503,13 @@ axiosInstance.interceptors.response.use(
 
         // 2. Prevent infinite retry
         if (originalRequest && (originalRequest as any)._retry) {
-          navigationService.navigateToLogin();
+          onAuthEvent({ type: 'unauthorized' });
           return Promise.reject(new Error('Authentication required'));
         }
 
         // 3. Check if in guest mode
-        const authStore = useAuthStore.getState();
         const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
-        const isGuest = currentToken && authStore.isGuestMode;
+        const isGuest = currentToken && getCredentials().isGuestMode;
 
         // 4. Guest mode: silent refresh and retry
         if (isGuest && originalRequest) {
@@ -511,13 +527,13 @@ axiosInstance.interceptors.response.use(
           } catch (refreshError) {
             console.error('Failed to refresh guest token:', refreshError);
             // Refresh failed, navigate to login
-            navigationService.navigateToLogin();
+            onAuthEvent({ type: 'unauthorized' });
             return Promise.reject(new Error('Failed to refresh authentication'));
           }
         }
 
         // 5. Non-guest mode: navigate to login page
-        navigationService.navigateToLogin();
+        onAuthEvent({ type: 'unauthorized' });
         return Promise.reject(new Error('Authentication required'));
       }
       throw new Error(
@@ -699,7 +715,7 @@ async function _readNdjsonStream(
  * Build auth headers for the streaming fetch request.
  */
 function _buildStreamHeaders(): HeadersInit {
-  const apiKey = useSettingsStore.getState().apiKey;
+  const apiKey = getCredentials().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
@@ -815,7 +831,7 @@ export const queryTextStream = async (
       if (response.status === 401) {
         const currentToken = localStorage.getItem('LIGHTRAG-API-TOKEN');
         const isGuest =
-          currentToken && useAuthStore.getState().isGuestMode;
+          currentToken && getCredentials().isGuestMode;
 
         if (isGuest) {
           // Only the token refresh + retry fetch are guarded here: a failure
@@ -844,7 +860,7 @@ export const queryTextStream = async (
               'Failed to refresh guest token for streaming:',
               refreshError
             );
-            navigationService.navigateToLogin();
+            onAuthEvent({ type: 'unauthorized' });
             throw new Error('Failed to refresh authentication', {
               cause: refreshError,
             });
@@ -853,7 +869,7 @@ export const queryTextStream = async (
           if (!retryResponse.ok) {
             if (retryResponse.status === 401) {
               // Refreshed token still rejected → genuine auth failure
-              navigationService.navigateToLogin();
+              onAuthEvent({ type: 'unauthorized' });
               throw new Error('Authentication required');
             }
             // Non-auth HTTP error on retry → classify like the first response
@@ -863,7 +879,7 @@ export const queryTextStream = async (
           activeResponse = retryResponse;
         } else {
           // Non-guest 401 → login
-          navigationService.navigateToLogin();
+          onAuthEvent({ type: 'unauthorized' });
           throw new Error('Authentication required');
         }
       } else {

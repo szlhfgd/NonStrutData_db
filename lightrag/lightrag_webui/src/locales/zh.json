@@ -178,6 +178,15 @@
         "copyFailed": "复制状态详情失败"
       }
     },
+    "librarySummary": {
+      "title": "文档库概览",
+      "total": "总计",
+      "completed": "已完成",
+      "processing": "处理中",
+      "pending": "待处理",
+      "failed": "失败",
+      "progress": "批次 {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "流水线状态",
       "busy": "流水线忙碌",

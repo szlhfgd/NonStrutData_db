@@ -178,6 +178,15 @@
         "copyFailed": "Failed to copy status details"
       }
     },
+    "librarySummary": {
+      "title": "Library Summary",
+      "total": "Total",
+      "completed": "Completed",
+      "processing": "Processing",
+      "pending": "Pending",
+      "failed": "Failed",
+      "progress": "Batch {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "Pipeline Status",
       "busy": "Pipeline Busy",

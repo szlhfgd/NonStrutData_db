@@ -4,3 +4,17 @@
 # Environment / secrets - do not commit
 .env
 *.log
+
+# Python virtual env / build artifacts
+.venv/
+__pycache__/
+*.egg-info/
+
+# Tooling / editor artifacts
+.envsitter/
+.idea/
+
+# Frontend lockfile (bun.lock is the source of truth)
+package-lock.json
+pnpm-lock.yaml
+yarn.lock

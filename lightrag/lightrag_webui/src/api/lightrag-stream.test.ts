@@ -27,23 +27,11 @@ Object.defineProperty(globalThis, 'sessionStorage', {
   configurable: true,
 })
 
-// Mock zustand stores — both return a vanilla store-like object with getState()
-let storeApiKey: string | null = null
+// Inject the transport seam directly — the transport no longer imports stores
+// or the navigation service, so tests drive guest-mode auth through
+// configureTransport instead of mocking the store modules.
 let storeIsGuestMode = false
-const fakeSettingsStore = { getState: () => ({ apiKey: storeApiKey }) }
-const fakeAuthStore = {
-  getState: () => ({
-    isGuestMode: storeIsGuestMode,
-    login: () => {},
-    setTokenRenewal: () => {},
-  }),
-}
 
-mock.module('@/stores/settings', () => ({ useSettingsStore: fakeSettingsStore }))
-mock.module('@/stores/state', () => ({ useAuthStore: fakeAuthStore }))
-mock.module('@/services/navigation', () => ({
-  navigationService: { navigateToLogin: () => {} },
-}))
 mock.module('@/lib/utils', () => ({
   errorMessage: (error: any) =>
     error instanceof Error ? error.message : `${error}`,
@@ -156,6 +144,14 @@ let restoreConsole: (() => void) | undefined
 
 beforeAll(async () => {
   apiModule = await import('./lightrag')
+  apiModule.configureTransport({
+    getCredentials: () => ({
+      apiKey: null,
+      isGuestMode: storeIsGuestMode,
+      isAuthenticated: false,
+    }),
+    onAuthEvent: () => {},
+  })
   const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
   const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
   restoreConsole = () => {
@@ -170,7 +166,6 @@ afterAll(() => {
 
 afterEach(() => {
   storageData.clear()
-  storeApiKey = null
   storeIsGuestMode = false
 })
 

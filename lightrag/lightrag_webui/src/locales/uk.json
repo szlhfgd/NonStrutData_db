@@ -178,6 +178,15 @@
         "copyFailed": "Не вдалося скопіювати відомості про статус"
       }
     },
+    "librarySummary": {
+      "title": "Зведення по бібліотеці",
+      "total": "Всього",
+      "completed": "Завершено",
+      "processing": "В обробці",
+      "pending": "Очікування",
+      "failed": "Помилки",
+      "progress": "Пакет {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "Статус пайплайну",
       "busy": "Пайплайн зайнятий",

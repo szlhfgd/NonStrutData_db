@@ -178,6 +178,15 @@
         "copyFailed": "複製狀態詳情失敗"
       }
     },
+    "librarySummary": {
+      "title": "文件庫概覽",
+      "total": "總計",
+      "completed": "已完成",
+      "processing": "處理中",
+      "pending": "待處理",
+      "failed": "失敗",
+      "progress": "批次 {{cur}}/{{total}}"
+    },
     "pipelineStatus": {
       "title": "流水線狀態",
       "busy": "流水線忙碌",
