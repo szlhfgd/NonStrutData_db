@@ -4,23 +4,24 @@
 
 本副本默认带 WebUI（文档管理 + 图谱可视化 + 对话），并针对实际使用做了本地化与界面改动。
 
-> 注意：这是一个 fork 工作副本。**全部项目代码在 `lightrag/` 子目录**（独立的嵌套 git 仓库）。除特殊说明外，命令都在 `lightrag/` 下执行。
-
 ## 目录结构
 
 ```
 ├── ui.cmd                 # 一键启动/关闭 WebUI + 后端（Windows）
 ├── AGENTS.md / CONTEXT.md # 仓库说明与领域术语
 ├── docs/                  # 本地 agent 工作流文档
-|── .scratch/              # 本地 markdown issue 追踪器
-└── lightrag/              # ★ 项目本体（嵌套 git 仓库）
+├── .scratch/              # 本地 markdown issue 追踪器
+├── .env                   # 环境变量配置（LLM / Embedding 等）
+├── env.example            # 后端配置模板（复制为 .env 使用）
+├── requirements.txt       # pip 运行时依赖（由 .venv 冻结，含 api）
+├── requirements-test.txt  # 测试依赖（可选）
+├── tests/                 # pytest 测试
+├── lightrag_webui/        # React 19 + TypeScript Web 前端（Vite + Tailwind）
+└── lightrag/              # ★ 项目本体
     ├── lightrag/          #   Python 核心包（LightRAG 类、存储后端、LLM 绑定、解析器）
-    ├── lightrag_webui/    #   React 19 + TypeScript Web 前端（Vite + Tailwind）
     ├── scripts/           #   测试/安装脚本
-    ├── tests/             #   pytest 测试（目录结构镜像 lightrag/）
     ├── rag_storage/       #   运行时知识图谱与存储数据
     ├── inputs/            #   文档输入目录
-    ├── env.example        #   后端配置模板（复制为 .env 使用）
     └── pyproject.toml     #   包与依赖定义（api / test / offline-* 等 extras）
 ```
 
@@ -36,18 +37,23 @@ cd lightrag
 uv sync --extra test
 # 需要 API 服务/文档解析时额外装：uv sync --extra api
 
+# 2b) 或用 pip（需 Python ≥ 3.10；在仓库根目录执行）
+# pip install -r requirements.txt            # 运行后端
+# pip install -r requirements-test.txt       # 测试依赖（可选）
+# pip install -e ./lightrag                  # 安装本项目 lightrag-hku
+
 # 3) 配置环境变量
-copy env.example .env    # 然后编辑 .env，填入 LLM / Embedding 配置
+# 在根目录编辑 .env（已配置好 SiliconFlow 的 LLM/Embedding/Rerank 绑定）
 ```
 
-前端（`lightrag/lightrag_webui`）：
+前端（`lightrag_webui`）：
 
 ```bash
 cd lightrag_webui
 bun install --frozen-lockfile   # 或 npm install --legacy-peer-deps（无 bun 时）
 ```
 
-> 本副本根目录已有现成环境：`.venv`（Python 3.12 + lightrag-hku 已装好），`lightrag\.env` 已配置 SiliconFlow 的 LLM/Embedding/Rerank 绑定，`lightrag_webui\node_modules` 已安装。通常无需重装，直接进入下一节。
+> 本副本根目录已有现成环境：`.venv`（Python 3.12 + lightrag-hku 已装好），`.env` 已配置 SiliconFlow 的 LLM/Embedding/Rerank 绑定，`lightrag_webui/node_modules` 已安装。通常无需重装，直接进入下一节。
 
 ## 使用
 
@@ -64,12 +70,11 @@ ui.cmd restart    # 先停后起
 ### 手动启动
 
 ```bash
-# 后端 API（生产/日常使用）
-cd lightrag
-lightrag-server          # 需要 lightrag\.env；默认 127.0.0.1:9621
+# 后端 API（生产/日常使用）—— 必须从仓库根目录启动（server 在启动目录加载 .env）
+.venv\Scripts\lightrag-server   # 需要根目录的 .env；默认 127.0.0.1:9621
 
 # 前端开发服务器（Vite HMR，端口 5173，代理到 9621）
-cd lightrag/lightrag_webui
+cd lightrag_webui
 npx vite --host          # 或 bun run dev
 ```
 
@@ -145,21 +150,20 @@ asyncio.run(main())
 ```bash
 # 后端测试：只跑与你改动模块对应的子目录（全套约 7000 个 >6 分钟）
 cd lightrag
-./scripts/test.sh tests/api/config        # 例：改了 api/config
-./scripts/test.sh tests/kg/redis_impl     # 例：改了 kg/redis_impl.py
-./scripts/test.sh tests                   # 全量（里程碑或跨模块改动时才跑）
+./scripts/test.sh ../tests/api/config        # 例：改了 api/config
+./scripts/test.sh ../tests/kg/redis_impl     # 例：改了 kg/redis_impl.py
+./scripts/test.sh ../tests                   # 全量（里程碑或跨模块改动时才跑）
 
 # 代码风格
 ruff check .
 
 # 前端
-cd lightrag_webui
+cd ../lightrag_webui
 bun run lint          # ESLint
 bun test              # Bun 内置测试
 bun run build         # 生产构建
 ```
 
-- 后端规范、存储契约、管道并发、purge 恢复等权威细节见 **`lightrag/AGENTS.md`**。
 - 前端领域术语见根目录 `CONTEXT.md`；本地 issue/triage 流程见 `docs/agents/`。
 
 ## 本副本的本地改动
@@ -171,4 +175,58 @@ bun run build         # 生产构建
 ## 相关文档
 
 - 上游项目：[HKUDS/LightRAG](https://github.com/HKUDS/LightRAG)
-- 本仓库 WebUI 说明：`lightrag/lightrag_webui/WEBUI-README.md`
+- WebUI 前端安装 / 构建 / 排错：见下文「WebUI 前端附录」（由 `lightrag_webui/WEBUI-README.md` 合并而来）
+
+## WebUI 前端附录
+
+### 安装
+
+要求 Node ≥ 20。推荐用 [Bun](https://bun.sh)：
+
+```bash
+cd lightrag_webui
+bun install --frozen-lockfile
+bun run build
+```
+
+构建产物输出到 `lightrag/lightrag/api/webui`（后端在生产模式内嵌服务该目录）。
+
+无 Bun 或 Bun 构建异常时可用 Node.js/npm：
+
+```bash
+cd lightrag_webui
+npm install
+npm run build
+```
+
+> 测试（`bun test`）仍需 Bun；其余脚本（`dev` / `build` / `preview` / `lint`）Bun 与 Node.js/npm 均可。
+
+### 开发
+
+```bash
+cd lightrag_webui
+bun run dev        # 或 npm run dev（Vite HMR，端口 5173）
+```
+
+### 常用脚本
+
+| 命令                                    | 说明            |
+| ------------------------------------- | ------------- |
+| `bun run dev` / `npm run dev`         | 启动开发服务器       |
+| `bun run build` / `npm run build`     | 生产构建          |
+| `bun run lint` / `npm run lint`       | 运行 linter     |
+| `bun run preview` / `npm run preview` | 预览生产构建        |
+| `bun run build:bun`                   | 显式用 Bun 运行时构建 |
+| `bun test`                            | 运行测试（仅 Bun）   |
+
+### 排错
+
+**`bun run build` 静默失败或 exit code 1** — 多为 Bun 版本不兼容或受限环境导致，改用 `npm install && npm run build`。
+
+**WSL 下 `could not open bin metadata file` / node_modules 损坏** — 已知 Bun 问题（路径在 `/mnt/c`、`/mnt/d` 等 Windows 挂载盘时，`drvfs`/`9p` 文件系统不支持 Bun 需要的链接/元数据操作）。按优先级修复：
+
+1. 把项目移到 Linux 文件系统（如 `~/LightRAG`）再 `rm -rf node_modules && bun install --frozen-lockfile && bun run build`（推荐）；
+2. 留在挂载盘则改用 Node.js/npm：`rm -rf node_modules && npm install && npm run build`；
+3. 升级 Bun（`bun upgrade`）。
+
+**`Cannot find package '@/lib'`** — 旧版本 vite 配置在加载时使用仅 Bun 可解析的 `@/` 别名导致，已在 `vite.config.ts` 改用相对导入修复。

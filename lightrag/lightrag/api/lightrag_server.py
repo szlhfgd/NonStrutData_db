@@ -1154,7 +1154,7 @@ def check_frontend_build():
 
     # 2. Check if this is a development environment (source directory exists)
     try:
-        source_dir = Path(__file__).parent.parent.parent / "lightrag_webui"
+        source_dir = Path(__file__).parent.parent.parent.parent / "lightrag_webui"
         src_dir = source_dir / "src"
 
         # Determine if this is a development environment: source directory exists and contains src directory

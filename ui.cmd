@@ -2,8 +2,7 @@
 setlocal
 set "ROOT=%~dp0"
 set "BACKEND_EXE=%ROOT%.venv\Scripts\lightrag-server.exe"
-set "BACKEND_DIR=%ROOT%lightrag"
-set "FRONTEND_DIR=%ROOT%lightrag\lightrag_webui"
+set "FRONTEND_DIR=%ROOT%lightrag_webui"
 
 if /i "%1"=="start"   goto :start
 if /i "%1"=="stop"    goto :stop
@@ -24,7 +23,7 @@ goto :start
 
 :start
 echo Starting backend (9621)...
-start "LightRAG Backend" cmd /k "set PYTHONIOENCODING=utf-8 && set LIGHTRAG_PARSER=*:native-teP,*:legacy-R && cd /d %BACKEND_DIR% && %BACKEND_EXE%"
+start "LightRAG Backend" cmd /k "set PYTHONIOENCODING=utf-8 && set LIGHTRAG_PARSER=*:native-teP,*:legacy-R && cd /d %ROOT% && %BACKEND_EXE%"
 echo Starting UI (5173)...
 start "LightRAG UI" cmd /k "cd /d %FRONTEND_DIR% && npx vite --host"
 echo.

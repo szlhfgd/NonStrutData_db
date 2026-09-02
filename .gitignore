@@ -18,3 +18,18 @@ __pycache__/
 package-lock.json
 pnpm-lock.yaml
 yarn.lock
+
+# Frontend (lightrag_webui) — merged from lightrag_webui/.gitignore
+logs/
+node_modules
+dist
+dist-ssr
+*.local
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
