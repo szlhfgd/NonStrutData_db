@@ -598,6 +598,20 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command line arguments
     """
+    # On Windows the default console encoding is often GBK, which cannot encode
+    # the emoji/box-drawing chars used below (e.g. "📡"), crashing startup with
+    # UnicodeEncodeError before the server boots. Force UTF-8 on stdout if the
+    # current encoding can't handle a representative char.
+    try:
+        if getattr(sys.stdout, "encoding", "").lower().replace("-", "") not in (
+            "utf8",
+            "utf16",
+            "utf32",
+        ):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        pass
+
     # Banner
     # Banner
     top_border = "╔══════════════════════════════════════════════════════════════╗"

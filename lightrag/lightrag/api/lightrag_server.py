@@ -2,6 +2,22 @@
 LightRAG FastAPI Server
 """
 
+import os as _os
+import sys as _sys
+
+# Fix: when launched as `python -m lightrag.api.lightrag_server` from the repo
+# root, sys.path[0] is the cwd, and the sibling project folder `lightrag/`
+# (which has no __init__.py) shadows the editable-installed package
+# `lightrag/lightrag/`. The namespace package resolves with __file__=None, so
+# `from lightrag import ROLES` (via __init__.py lazy __getattr__) never fires.
+# Prepend the real package parent and re-resolve before any lightrag import.
+_REAL_PKG_PARENT = _os.path.join(_os.getcwd(), "lightrag")
+if _REAL_PKG_PARENT not in _sys.path:
+    _sys.path.insert(0, _REAL_PKG_PARENT)
+_mod = _sys.modules.get("lightrag")
+if _mod is not None and getattr(_mod, "__file__", None) is None:
+    _sys.modules.pop("lightrag", None)
+
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Response

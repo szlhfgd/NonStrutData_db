@@ -2474,15 +2474,47 @@ async def pipeline_enqueue_file(
         parse_engine_field = encode_parse_engine(
             extraction_engine, directives.engine_params
         )
+
+        # Pre-Insert Inspection (ADR 0001): for PDFs, classify before enqueue.
+        # text_based → extract Markdown locally and enqueue as RAW (parser
+        # bypass, the Local Path). Other PDF types → fall through to
+        # PENDING_PARSE (the API Path, OCR via existing external parsers).
+        # Non-PDF or inspector failure → unchanged PENDING_PARSE (fail-open).
+        pre_insert_markdown: str | None = None
         try:
-            enqueue_kwargs = {
-                "file_paths": str(file_path),
-                "track_id": track_id,
-                "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
-                "parse_engine": parse_engine_field,
-                "process_options": api_process_options,
-                "from_scan": from_scan,
-            }
+            from pre_insert import inspect_pdf
+
+            outcome = await asyncio.to_thread(inspect_pdf, file_path)
+            if outcome is not None and outcome.markdown is not None:
+                pre_insert_markdown = outcome.markdown
+                parse_engine_field = "pdf_inspector"
+        except Exception as e:
+            logger.warning(
+                "[Pre-Insert] Inspection dispatch failed for "
+                f"{file_path.name}: {e!r} (fail-open, proceeding to parser chain)"
+            )
+
+        try:
+            if pre_insert_markdown is not None:
+                # Local Path: pre-extracted Markdown, skip the parser chain.
+                enqueue_kwargs = {
+                    "input": pre_insert_markdown,
+                    "file_paths": str(file_path),
+                    "track_id": track_id,
+                    "docs_format": FULL_DOCS_FORMAT_RAW,
+                    "parse_engine": parse_engine_field,
+                    "process_options": api_process_options,
+                    "from_scan": from_scan,
+                }
+            else:
+                enqueue_kwargs = {
+                    "file_paths": str(file_path),
+                    "track_id": track_id,
+                    "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
+                    "parse_engine": parse_engine_field,
+                    "process_options": api_process_options,
+                    "from_scan": from_scan,
+                }
             if admission_token is not None:
                 # Only sent when the caller actually holds a reservation; None
                 # is the enqueue's own default and adding it would be noise.
