@@ -81,6 +81,7 @@ from lightrag.constants import (
     DEFAULT_SCAN_ENQUEUE_BATCH_SIZE,
     FILE_EXTRACTION_SUMMARY_PREFIX,
     FULL_DOCS_FORMAT_PENDING_PARSE,
+    FULL_DOCS_FORMAT_RAW,
     MAX_R_SEPARATOR_CHARS,
     MAX_R_SEPARATORS,
     PARSED_ARTIFACT_DIR_SUFFIXES,
@@ -2497,8 +2498,9 @@ async def pipeline_enqueue_file(
         try:
             if pre_insert_markdown is not None:
                 # Local Path: pre-extracted Markdown, skip the parser chain.
+                # ``input`` is passed positionally (it is the enqueue's first
+                # positional param) so it does not also collide as a kwarg.
                 enqueue_kwargs = {
-                    "input": pre_insert_markdown,
                     "file_paths": str(file_path),
                     "track_id": track_id,
                     "docs_format": FULL_DOCS_FORMAT_RAW,
@@ -2521,7 +2523,10 @@ async def pipeline_enqueue_file(
                 enqueue_kwargs["admission_token"] = admission_token
             if hint_chunk_options is not None:
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
-            enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
+            enqueue_result = await rag.apipeline_enqueue_documents(
+                pre_insert_markdown if pre_insert_markdown is not None else "",
+                **enqueue_kwargs,
+            )
             if enqueue_result is None:
                 try:
                     await move_file_to_parsed_dir(file_path)
