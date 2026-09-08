@@ -32,7 +32,7 @@ root                       operational workspace, everything tracked by root git
 ├── .venv/                 Python 3.12 env (runtime-only unless you add test deps)
 ├── tests/                 pytest suite, mirrors lightrag/lightrag/<module>
 ├── lightrag_webui/        React 19 + Vite + TS frontend (bun.lock pins deps)
-├──pre_insert /#文档摄入之前先检查文档结构
+├── pre_insert/            pre-insert PDF inspection gate (classifies PDFs before parser; see docs/adr/0001)
 └── lightrag/
     ├── lightrag/api/      server entry (lightrag_server.py), config.py, built webui
     ├── lightrag/          python package (storage backends, llm bindings, parsers)
@@ -46,7 +46,16 @@ root                       operational workspace, everything tracked by root git
 - pytest config in `lightrag/pyproject.toml`: `asyncio_mode = auto`, `testpaths = ["tests"]`.
 - Pre-commit (ruff + format) config at `lightrag/.pre-commit-config.yaml`.
 
-## Domain & workflow docs
+## Agent skills
 
-- Glossary: root `CONTEXT.md`. Upstream architecture / storage contracts / purge recovery / PR conventions: HKUDS/LightRAG docs + `lightrag/lightrag/` source.
-- Local issue tracker: `.scratch/<feature>/` (`docs/agents/issue-tracker.md`); triage labels: `docs/agents/triage-labels.md`.
+### Issue tracker
+
+Issues live as markdown files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical roles: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`. Upstream architecture / storage contracts / purge recovery / PR conventions: HKUDS/LightRAG docs + `lightrag/lightrag/` source.

@@ -1,0 +1,7 @@
+# Test framework dependencies — mirrors pyproject [project.optional-dependencies] "test".
+#   pip install -r requirements.txt -r requirements-test.txt
+pytest>=8.4.2
+pytest-asyncio>=1.2.0
+pre-commit
+ruff
+httpx2>=2.0.0
