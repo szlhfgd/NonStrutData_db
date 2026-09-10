@@ -42,6 +42,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -2477,18 +2478,23 @@ async def pipeline_enqueue_file(
         )
 
         # Pre-Insert Inspection (ADR 0001): for PDFs, classify before enqueue.
-        # text_based → extract Markdown locally and enqueue as RAW (parser
-        # bypass, the Local Path). Other PDF types → fall through to
-        # PENDING_PARSE (the API Path, OCR via existing external parsers).
-        # Non-PDF or inspector failure → unchanged PENDING_PARSE (fail-open).
-        pre_insert_markdown: str | None = None
+        # The deep interface returns an EnqueueDirective carrying the complete
+        # routing decision (docs_format, parse_engine, content) when the Local
+        # Path applies, or None for fall-through (non-PDF, non-text-based PDF,
+        # or inspector failure — fail-open). The caller merges the directive's
+        # fields without knowing what "pdf_inspector" means or which format the
+        # Local Path uses.
+        pre_insert_content: str | None = None
+        pre_insert_docs_format = FULL_DOCS_FORMAT_PENDING_PARSE
+        pre_insert_parse_engine = parse_engine_field
         try:
-            from pre_insert import inspect_pdf
+            from pre_insert import inspect_for_enqueue
 
-            outcome = await asyncio.to_thread(inspect_pdf, file_path)
-            if outcome is not None and outcome.markdown is not None:
-                pre_insert_markdown = outcome.markdown
-                parse_engine_field = "pdf_inspector"
+            directive = await asyncio.to_thread(inspect_for_enqueue, file_path)
+            if directive is not None:
+                pre_insert_content = directive.content
+                pre_insert_docs_format = directive.docs_format
+                pre_insert_parse_engine = directive.parse_engine
         except Exception as e:
             logger.warning(
                 "[Pre-Insert] Inspection dispatch failed for "
@@ -2496,27 +2502,16 @@ async def pipeline_enqueue_file(
             )
 
         try:
-            if pre_insert_markdown is not None:
-                # Local Path: pre-extracted Markdown, skip the parser chain.
-                # ``input`` is passed positionally (it is the enqueue's first
-                # positional param) so it does not also collide as a kwarg.
-                enqueue_kwargs = {
-                    "file_paths": str(file_path),
-                    "track_id": track_id,
-                    "docs_format": FULL_DOCS_FORMAT_RAW,
-                    "parse_engine": parse_engine_field,
-                    "process_options": api_process_options,
-                    "from_scan": from_scan,
-                }
-            else:
-                enqueue_kwargs = {
-                    "file_paths": str(file_path),
-                    "track_id": track_id,
-                    "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
-                    "parse_engine": parse_engine_field,
-                    "process_options": api_process_options,
-                    "from_scan": from_scan,
-                }
+            # ``input`` is passed positionally (it is the enqueue's first
+            # positional param) so it does not also collide as a kwarg.
+            enqueue_kwargs = {
+                "file_paths": str(file_path),
+                "track_id": track_id,
+                "docs_format": pre_insert_docs_format,
+                "parse_engine": pre_insert_parse_engine,
+                "process_options": api_process_options,
+                "from_scan": from_scan,
+            }
             if admission_token is not None:
                 # Only sent when the caller actually holds a reservation; None
                 # is the enqueue's own default and adding it would be noise.
@@ -2524,7 +2519,7 @@ async def pipeline_enqueue_file(
             if hint_chunk_options is not None:
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
             enqueue_result = await rag.apipeline_enqueue_documents(
-                pre_insert_markdown if pre_insert_markdown is not None else "",
+                pre_insert_content if pre_insert_content is not None else "",
                 **enqueue_kwargs,
             )
             if enqueue_result is None:
@@ -5233,6 +5228,7 @@ def create_document_routes(
         managed_tasks: set = Depends(get_managed_background_tasks),
         file: UploadFile = File(...),
         http_request: Request = None,
+        parse_engine: str = Form(""),
     ):
         """
         Upload a file to the input directory and index it.
@@ -5314,7 +5310,17 @@ def create_document_routes(
 
         enqueue_token, admission_adopted = _adopt_or_new_enqueue_token(http_request)
         handed_off = False
+        VALID_ENGINES = {"mineru", "docling", "native"}
         try:
+            if parse_engine and parse_engine not in VALID_ENGINES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Invalid parse_engine '{parse_engine}'. "
+                        f"Valid: {sorted(VALID_ENGINES)}"
+                    ),
+                )
+
             # Reject upload while a scan is in its CLASSIFICATION
             # phase or a destructive job (clear / per-doc delete) is
             # in flight, AND reserve a pending-enqueue slot so a scan
@@ -5330,6 +5336,9 @@ def create_document_routes(
 
             # Sanitize filename to prevent Path Traversal attacks
             safe_filename = sanitize_filename(file.filename, doc_manager.input_dir)
+            if parse_engine:
+                _p = Path(safe_filename)
+                safe_filename = f"{_p.stem}.[{parse_engine}]{_p.suffix}"
 
             # Resolve engine + process options once and reuse the result for
             # both gates below; each resolution costs a hint parse plus a

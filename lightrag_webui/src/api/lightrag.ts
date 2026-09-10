@@ -912,10 +912,14 @@ export const insertTexts = async (texts: string[]): Promise<DocActionResponse> =
 
 export const uploadDocument = async (
   file: File,
-  onUploadProgress?: (percentCompleted: number) => void
+  onUploadProgress?: (percentCompleted: number) => void,
+  parseEngine?: string
 ): Promise<DocActionResponse> => {
   const formData = new FormData()
   formData.append('file', file)
+  if (parseEngine) {
+    formData.append('parse_engine', parseEngine)
+  }
 
   const response = await axiosInstance.post('/documents/upload', formData, {
     headers: {
@@ -935,13 +939,14 @@ export const uploadDocument = async (
 
 export const batchUploadDocuments = async (
   files: File[],
-  onUploadProgress?: (fileName: string, percentCompleted: number) => void
+  onUploadProgress?: (fileName: string, percentCompleted: number) => void,
+  parseEngine?: string
 ): Promise<DocActionResponse[]> => {
   return await Promise.all(
     files.map(async (file) => {
       return await uploadDocument(file, (percentCompleted) => {
         onUploadProgress?.(file.name, percentCompleted)
-      })
+      }, parseEngine)
     })
   )
 }

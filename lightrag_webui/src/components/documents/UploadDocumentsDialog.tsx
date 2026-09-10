@@ -10,6 +10,19 @@ import {
   DialogTrigger
 } from '@/components/ui/Dialog'
 import FileUploader from '@/components/ui/FileUploader'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue
+} from '@/components/ui/Select'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger
+} from '@/components/ui/Tooltip'
 import { toast } from 'sonner'
 import { supportedFileTypes } from '@/lib/constants'
 import {
@@ -19,7 +32,7 @@ import {
   normalizeSupportedFileTypes,
   type FileTypesState
 } from '@/lib/fileTypes'
-import { errorMessage } from '@/lib/utils'
+import { errorMessage, cn } from '@/lib/utils'
 import { getSupportedFileTypes, uploadDocument } from '@/api/lightrag'
 
 import { UploadIcon } from 'lucide-react'
@@ -45,6 +58,7 @@ export default function UploadDocumentsDialog({
   const [progresses, setProgresses] = useState<Record<string, number>>({})
   const [fileErrors, setFileErrors] = useState<Record<string, string>>({})
   const [fileTypes, setFileTypes] = useState<FileTypesState>({ status: 'idle' })
+  const [parseEngine, setParseEngine] = useState('')
 
   // Fetch the live allowlist + engine capability matrix while the dialog is
   // open. `loading` is entered synchronously in onOpenChange (not here) so
@@ -142,7 +156,7 @@ export default function UploadDocumentsDialog({
                 ...pre,
                 [file.name]: percentCompleted
               }))
-            })
+            }, parseEngine)
 
             if (result.status !== 'success') {
               uploadErrors[file.name] = result.message
@@ -236,7 +250,7 @@ export default function UploadDocumentsDialog({
         setIsUploading(false)
       }
     },
-    [setIsUploading, setProgresses, setFileErrors, t, onDocumentsUploaded, onUploadBatchAccepted]
+    [setIsUploading, setProgresses, setFileErrors, t, onDocumentsUploaded, onUploadBatchAccepted, parseEngine]
   )
 
   const uploaderInputs = deriveUploaderInputs(fileTypes)
@@ -257,6 +271,7 @@ export default function UploadDocumentsDialog({
           setProgresses({})
           setFileErrors({})
           setFileTypes({ status: 'idle' })
+          setParseEngine('')
         }
         setOpen(nextOpen)
       }}
@@ -273,6 +288,51 @@ export default function UploadDocumentsDialog({
             {t('documentPanel.uploadDocuments.description')}
           </DialogDescription>
         </DialogHeader>
+        <div className="flex items-center gap-2">
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <label
+                  htmlFor="parse_engine_select"
+                  className="text-sm font-medium cursor-help whitespace-nowrap"
+                >
+                  {t('documentPanel.uploadDocuments.parseEngine.label')}
+                </label>
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                <p>{t('documentPanel.uploadDocuments.parseEngine.tooltip')}</p>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <Select
+            value={parseEngine}
+            onValueChange={setParseEngine}
+            disabled={isUploading}
+          >
+            <SelectTrigger
+              id="parse_engine_select"
+              className={cn(
+                'h-9 cursor-pointer focus:ring-0 focus:ring-offset-0 focus:outline-0 flex-1 text-left'
+              )}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="">
+                {t('documentPanel.uploadDocuments.parseEngine.default')}
+              </SelectItem>
+              <SelectItem value="native">
+                {t('documentPanel.uploadDocuments.parseEngine.native')}
+              </SelectItem>
+              <SelectItem value="mineru">
+                {t('documentPanel.uploadDocuments.parseEngine.mineru')}
+              </SelectItem>
+              <SelectItem value="docling">
+                {t('documentPanel.uploadDocuments.parseEngine.docling')}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
         <FileUploader
           maxFileCount={Infinity}
           maxSize={200 * 1024 * 1024}

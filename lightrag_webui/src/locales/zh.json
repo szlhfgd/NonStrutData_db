@@ -115,6 +115,14 @@
         "removeFile": "移除文件",
         "uploadDescription": "您可以上传{{isMultiple ? '多个' : count}}个文件（每个文件最大{{maxSize}}）",
         "duplicateFile": "文件名与服务器上的缓存重复"
+      },
+      "parseEngine": {
+        "label": "解析引擎",
+        "default": "默认（按路由）",
+        "native": "Native",
+        "mineru": "MinerU",
+        "docling": "Docling",
+        "tooltip": "为本次上传选择解析引擎。默认遵循全局路由规则。"
       }
     },
     "documentManager": {

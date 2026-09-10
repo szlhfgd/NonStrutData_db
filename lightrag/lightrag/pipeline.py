@@ -17,6 +17,7 @@ import inspect
 import json
 
 import mimetypes
+import re
 import threading
 import time
 import traceback
@@ -78,6 +79,7 @@ from lightrag.kg.shared_storage import (
 from lightrag import pipeline_metrics
 from lightrag.kg.pipeline_ingress import PipelineIngressMessage
 from lightrag.operate import merge_nodes_and_edges
+from lightrag.sidecar.placeholders import xml_attr_escape
 from lightrag.parser.base import ParseContext
 from lightrag.parser.exceptions import (
     ParsePipelineCancelled,
@@ -7284,6 +7286,66 @@ class _PipelineMixin:
             base_name = str(block_file)
             if base_name.endswith(".blocks.jsonl"):
                 base_name = base_name[: -len(".blocks.jsonl")]
+
+            def _backfill_blocks_drawing_captions(
+                caption_updates: dict[str, str],
+            ) -> None:
+                """Rewrite ``<drawing id="im-…" …/>`` caption attributes in the
+                parsed document's ``.blocks.jsonl`` with the VLM-generated
+                descriptions. ``caption_updates`` maps a drawing id to the
+                caption text to persist. Read → patch → write is done once and
+                failures degrade to a warning: the VLM result was already
+                persisted to ``drawings.json``, so a stale placeholder caption
+                is non-fatal for downstream chunking."""
+                try:
+                    lines = block_file.read_text(encoding="utf-8").splitlines()
+                except OSError as exc:
+                    logger.warning(
+                        f"[analyze_multimodal] cannot read blocks for caption "
+                        f"backfill {block_file}: {exc}"
+                    )
+                    return
+                changed_lines: list[str] = []
+                for line in lines:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        changed_lines.append(line)
+                        continue
+                    content = row.get("content") if isinstance(row, dict) else None
+                    if not isinstance(content, str):
+                        changed_lines.append(line)
+                        continue
+                    new_content = content
+                    for item_id, caption in caption_updates.items():
+                        if f'id="{item_id}"' not in new_content:
+                            continue
+                        escaped = xml_attr_escape(caption)
+
+                        def _patch(m: re.Match[str]) -> str:
+                            tag = re.sub(r'\s+caption="[^"]*"', "", m.group(1)).rstrip()
+                            return f'{tag} caption="{escaped}" />'
+
+                        new_content = re.sub(
+                            rf'(<drawing\b[^>]*?\bid="{re.escape(item_id)}"[^>]*?)/>',
+                            _patch,
+                            new_content,
+                        )
+                    if new_content != content:
+                        row["content"] = new_content
+                        changed_lines.append(json.dumps(row, ensure_ascii=False))
+                    else:
+                        changed_lines.append(line)
+                try:
+                    block_file.write_text(
+                        "\n".join(changed_lines) + "\n", encoding="utf-8"
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        f"[analyze_multimodal] failed to write backfilled blocks "
+                        f"{block_file}: {exc}"
+                    )
+
             sidecars = [
                 (
                     Path(base_name + ".drawings.json"),
@@ -7418,6 +7480,7 @@ class _PipelineMixin:
 
                 # Collect results — preserve completed successes so reprocess
                 # can hit the LLM cache instead of re-running the VLM.
+                drawing_caption_updates: dict[str, str] = {}
                 for t, (item_id, item) in task_meta.items():
                     if t.cancelled():
                         item["llm_analyze_result"] = _failure_result("cancelled")
@@ -7427,6 +7490,20 @@ class _PipelineMixin:
                         result_obj, cache_id = t.result()
                         item["llm_analyze_result"] = result_obj
                         _attach_cache_id(item, cache_id)
+                        if (
+                            kind == "drawing"
+                            and isinstance(result_obj, dict)
+                            and result_obj.get("status") == "success"
+                        ):
+                            vlm_desc = (result_obj.get("description") or "").strip()
+                            if vlm_desc:
+                                existing_caption = item.get("caption") or ""
+                                item["caption"] = (
+                                    f"{existing_caption} | {vlm_desc}"
+                                    if existing_caption
+                                    else vlm_desc
+                                )
+                                drawing_caption_updates[item_id] = item["caption"]
                     elif isinstance(texc, PipelineCancelledException):
                         item["llm_analyze_result"] = _failure_result("cancelled")
                     elif isinstance(texc, MultimodalAnalysisError):
@@ -7446,6 +7523,9 @@ class _PipelineMixin:
                         f"[analyze_multimodal] failed to write sidecar "
                         f"{sidecar_path}: {exc}"
                     )
+
+                if kind == "drawing" and drawing_caption_updates:
+                    _backfill_blocks_drawing_captions(drawing_caption_updates)
 
                 if fail_fast_exc is not None:
                     # Best-effort cache flush so any cache_ids written by

@@ -115,6 +115,14 @@
         "removeFile": "Remove file",
         "uploadDescription": "You can upload {{isMultiple ? 'multiple' : count}} files (up to {{maxSize}} each)",
         "duplicateFile": "File name already exists in server cache"
+      },
+      "parseEngine": {
+        "label": "Parse Engine",
+        "default": "Default (by routing)",
+        "native": "Native",
+        "mineru": "MinerU",
+        "docling": "Docling",
+        "tooltip": "Select a parser engine for this upload. Default follows global routing rules."
       }
     },
     "documentManager": {
